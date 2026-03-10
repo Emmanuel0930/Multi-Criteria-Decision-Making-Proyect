@@ -145,7 +145,9 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     # Step 2 – Feature engineering
     # ------------------------------------------------------------------
     _banner("STEP 2 – Engineering spatial features")
-    features_df = engineer_features(hex_grid, seed=config["feature_seed"])
+    db_path = os.path.join(_DATA_DIR, "hexagon_features.db")
+
+    features_df = engineer_features(hex_grid, db_path=db_path)
 
     raw_feature_cols = list(FEATURE_DIRECTION.keys())
     validate_feature_dataframe(features_df, ["hex_id", "lon", "lat"] + raw_feature_cols)
