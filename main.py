@@ -74,7 +74,7 @@ from visualization        import (create_interactive_map, create_static_map,
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG: Dict[str, Any] = {
     # Grid
-    "resolution":          7,      # H3-like resolution (4=coarse … 7=fine; 55=~600 hex, 65=~800 hex)
+    "resolution":          6,      # H3-like resolution (4=coarse … 7=fine; 55=~600 hex, 65=~800 hex)
 
     # Feature engineering
     "feature_seed":        42,
@@ -99,6 +99,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # Paths (relative to project root)
     "geojson_path":  os.path.join(_DATA_DIR, "colombia_boundary.geojson"),
+    "municipios_path": os.path.join(_DATA_DIR, "DIVIPOLA_CentrosPoblados.csv"),
     "output_dir":    _OUT_DIR,
 }
 
@@ -139,6 +140,7 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     hex_grid = generate_colombia_hex_grid(
         config["geojson_path"],
         resolution=config["resolution"],
+        municipios_path=config["municipios_path"],
     )
 
     # ------------------------------------------------------------------
@@ -354,7 +356,7 @@ def _parse_args() -> argparse.Namespace:
         description="Colombia Wind Farm Suitability – MCDA Pipeline"
     )
     parser.add_argument(
-        "--resolution", type=int, default=7,
+        "--resolution", type=int, default=6,
         choices=[4, 5, 55, 65, 6, 75, 7],
         help="Grid resolution: 4=~88km, 5=~44km, 55=~27km (~600 hex), 65=~23km (~800 hex), 6=~22km, 7=~11km"
     )
@@ -394,3 +396,5 @@ if __name__ == "__main__":
     })
 
     results = run_pipeline(config)
+
+
