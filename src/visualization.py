@@ -174,6 +174,12 @@ def create_interactive_map(
     """
     print("[Map] Building self-contained Canvas map (no external deps)...")
 
+    def _safe_str(value: object, default: str = "Unknown") -> str:
+      if pd.isna(value):
+        return default
+      text = str(value).strip()
+      return text if text else default
+
     # ------------------------------------------------------------------
     # Build a compact data payload for JavaScript
     # ------------------------------------------------------------------
@@ -194,6 +200,9 @@ def create_interactive_map(
             "s":     round(score, 4),
             "top":   row["hex_id"] in top_ids,
             "rank":  int(row["rank"]) if "rank" in row.index and not pd.isna(row.get("rank")) else None,
+          "dp":    _safe_str(row.get("divipola_code", "Unknown")),
+          "mu":    _safe_str(row.get("municipality", "Unknown")),
+          "de":    _safe_str(row.get("department", "Unknown")),
             "ws":    round(float(row.get("wind_speed",   0) or 0), 2),
             "sl":    round(float(row.get("slope",        0) or 0), 2),
             "dg":    round(float(row.get("dist_to_grid", 0) or 0), 1),
@@ -428,6 +437,8 @@ function showPopup(idx, px, py){{
     (c.rank ? '#'+c.rank+' — ' : '') + c.id;
   var col = sc>0.6?'#27ae60':sc>0.4?'#e67e22':'#e74c3c';
   document.getElementById('pop-body').innerHTML =
+    '<b>DIVIPOLA:</b> '+c.dp+'<br>'+
+    '<b>Municipio, Departamento:</b> '+c.mu+', '+c.de+'<hr>'+
     '<b>Suitability:</b> <span style="color:'+col+';font-weight:700">'+sc.toFixed(3)+'</span><hr>'+
     '<b>Wind speed:</b> '+c.ws+' m/s<br>'+
     '<b>Slope:</b> '+c.sl+'°<br>'+
