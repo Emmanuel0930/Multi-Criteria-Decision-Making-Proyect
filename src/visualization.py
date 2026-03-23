@@ -545,59 +545,6 @@ draw();
           f"({os.path.getsize(output_path) / 1024:.0f} KB)")
 
 
-# ---------------------------------------------------------------------------
-# Static matplotlib map
-# ---------------------------------------------------------------------------
-
-def create_static_map(
-    df: pd.DataFrame,
-    output_path: str,
-    score_column: str = "suitability_score",
-    top_n: int = 10,
-) -> None:
-    """
-    Create a static scatter map of suitability scores using matplotlib.
-
-    Parameters
-    ----------
-    df          : scored hex-grid DataFrame
-    output_path : save path for PNG
-    score_column: name of the score column
-    top_n       : number of top sites to annotate
-    """
-    fig, ax = plt.subplots(figsize=(8, 10))
-
-    scores = df[score_column].to_numpy()
-    sc = ax.scatter(
-        df["lon"], df["lat"],
-        c=scores, cmap="RdYlGn",
-        s=20, alpha=0.75, linewidths=0,
-        vmin=0, vmax=1,
-    )
-
-    # Annotate top N
-    top_df = df.nlargest(top_n, score_column)
-    for _, row in top_df.iterrows():
-        ax.annotate(
-            "★", (row["lon"], row["lat"]),
-            fontsize=12, ha="center", va="center", color="#2c3e50",
-        )
-
-    cbar = plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.02)
-    cbar.set_label("Suitability Score [0-1]", fontsize=10)
-
-    ax.set_xlabel("Longitude (°W)", fontsize=10)
-    ax.set_ylabel("Latitude (°N)", fontsize=10)
-    ax.set_title("Wind Farm Suitability — Colombia\n(★ = top candidate sites)",
-                 fontsize=12, fontweight="bold")
-    ax.set_facecolor("#d6eaf8")
-    ax.spines[["top", "right"]].set_visible(False)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[Map] Static map saved → {output_path}")
-
 
 # ---------------------------------------------------------------------------
 # Score distribution plot
@@ -723,6 +670,5 @@ if __name__ == "__main__":
     scored_df = compute_wlc_scores(norm_df, weights, norm_cols)
     ranked_df = rank_locations(scored_df)
 
-    create_static_map(scored_df, os.path.join(_OUT, "map_static.png"))
     plot_score_distribution(scored_df, os.path.join(_OUT, "score_distribution.png"))
     create_interactive_map(ranked_df, os.path.join(_OUT, "map_interactive.html"))

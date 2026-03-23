@@ -60,13 +60,7 @@ from feature_engineering  import engineer_features
 from normalization        import normalise_features, get_norm_feature_names, FEATURE_DIRECTION
 from random_forest_weights import get_rf_weights
 from mcda_model           import compute_wlc_scores, rank_locations, summarise_top_locations
-from shap_explainer       import (compute_local_shap, global_shap_summary,
-                                   rf_permutation_importance,
-                                   plot_global_shap, plot_local_shap,
-                                   plot_rf_permutation_importance)
-from sensitivity_analysis import (oat_sensitivity, monte_carlo_sensitivity,
-                                   plot_oat_sensitivity, plot_mc_sensitivity)
-from visualization        import (create_interactive_map, create_static_map,
+from visualization        import (create_interactive_map,
                                    plot_score_distribution, plot_feature_correlation)
 
 # ---------------------------------------------------------------------------
@@ -191,78 +185,11 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     summarise_top_locations(ranked_df, top_n=config["top_n"],
                              score_column=config["score_column"])
 
+   
     # ------------------------------------------------------------------
-    # Step 7 – SHAP explainability
+    # Step 7 – Visualisation and export
     # ------------------------------------------------------------------
-    _banner("STEP 7 – Computing SHAP-like explanations")
-
-    shap_df, shap_cols = compute_local_shap(ranked_df, weights, norm_cols,
-                                             score_column=config["score_column"])
-    shap_summary = global_shap_summary(shap_df, shap_cols, weights)
-    print("\nGlobal SHAP summary:")
-    print(shap_summary.to_string(index=False))
-
-    # RF permutation importance
-    perm_imp = rf_permutation_importance(model, norm_df, norm_cols, labels,
-                                          seed=config["rf_seed"], n_repeats=5)
-    print("\nPermutation importance (RF):")
-    print(perm_imp.to_string(index=False))
-
-    # Plot global SHAP
-    plot_global_shap(
-        shap_summary,
-        os.path.join(config["output_dir"], "shap_global_importance.png"),
-    )
-
-    # Plot local SHAP for top-1 and top-10 cells
-    top1_id = shap_df.nlargest(1, config["score_column"])["hex_id"].iloc[0]
-    plot_local_shap(
-        shap_df, shap_cols, top1_id,
-        os.path.join(config["output_dir"], "shap_local_top1.png"),
-    )
-
-    # Try to find an "interesting" mid-ranked cell for contrast
-    mid_rank = len(shap_df) // 2
-    mid_id = shap_df.iloc[mid_rank]["hex_id"]
-    plot_local_shap(
-        shap_df, shap_cols, mid_id,
-        os.path.join(config["output_dir"], "shap_local_midrank.png"),
-    )
-
-    # RF permutation importance chart
-    plot_rf_permutation_importance(
-        perm_imp,
-        os.path.join(config["output_dir"], "rf_permutation_importance.png"),
-    )
-
-    # ------------------------------------------------------------------
-    # Step 8 – Sensitivity analysis
-    # ------------------------------------------------------------------
-    _banner("STEP 8 – Sensitivity analysis")
-
-    oat_df = oat_sensitivity(
-        scored_df, weights, norm_cols,
-        delta_range=config["oat_delta_range"],
-        n_steps=config["oat_n_steps"],
-    )
-    mc_df, mc_stability = monte_carlo_sensitivity(
-        scored_df, weights, norm_cols,
-        n_samples=config["mc_n_samples"],
-        concentration=config["mc_concentration"],
-    )
-
-    plot_oat_sensitivity(oat_df,
-                          os.path.join(config["output_dir"], "sensitivity_oat.png"))
-    plot_mc_sensitivity(mc_df,
-                         os.path.join(config["output_dir"], "sensitivity_mc.png"))
-
-    print("\nMC weight stability per feature:")
-    print(mc_stability.to_string(index=False))
-
-    # ------------------------------------------------------------------
-    # Step 9 – Visualisation and export
-    # ------------------------------------------------------------------
-    _banner("STEP 9 – Generating visualisations and exporting results")
+    _banner("STEP 7 – Generating visualisations and exporting results")
 
     # Interactive HTML map – show ALL cells coloured by score, highlight top-N
     create_interactive_map(
@@ -270,13 +197,6 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         os.path.join(config["output_dir"], "map_interactive.html"),
         score_column=config["score_column"],
         top_n_highlight=10,
-    )
-
-    # Static PNG map
-    create_static_map(
-        ranked_df,
-        os.path.join(config["output_dir"], "map_static.png"),
-        score_column=config["score_column"],
     )
 
     # Distribution plot
@@ -304,12 +224,6 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         ranked_df,
         os.path.join(config["output_dir"], "suitability_scores.geojson"),
         score_column=config["score_column"],
-    )
-
-    # OAT sensitivity results
-    oat_df.to_csv(
-        os.path.join(config["output_dir"], "sensitivity_oat.csv"),
-        index=False, float_format="%.4f",
     )
 
     # Summary report
@@ -341,9 +255,6 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
         "labels":      labels,
         "scored_df":   scored_df,
         "ranked_df":   ranked_df,
-        "shap_df":     shap_df,
-        "oat_df":      oat_df,
-        "mc_df":       mc_df,
     }
 
 
