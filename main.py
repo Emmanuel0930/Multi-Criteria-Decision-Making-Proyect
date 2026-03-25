@@ -30,6 +30,7 @@ editing individual module files.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -73,7 +74,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "algorithm":      "ahp",
 
     # Grid
-    "resolution":     6,          # 4=~88km  5=~44km  55=~27km  6=~22km  7=~11km  8=~5km
+    "resolution":     7,          # 4=~88km  5=~44km  55=~27km  6=~22km  7=~11km  8=~5km
 
     # Feature engineering
     "feature_seed":   42,
@@ -92,8 +93,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "protected_threshold": 0.7,   # celdas con área protegida > umbral se excluyen
 
     # Rutas
-    "geojson_path":        os.path.join(_DATA_DIR, "colombia_boundary.geojson"),
-    "output_dir":          _OUT_DIR,
+    "geojson_path":  os.path.join(_DATA_DIR, "colombia_boundary.geojson"),
+    "municipios_path": os.path.join(_DATA_DIR, "DIVIPOLA_CentrosPoblados.csv"),
+    "output_dir":    _OUT_DIR,
 }
 
 
@@ -194,6 +196,8 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
     hex_grid = generate_colombia_hex_grid(
         config["geojson_path"],
         resolution=config["resolution"],
+        municipios_path=config["municipios_path"],
+
     )
 
     # ------------------------------------------------------------------
