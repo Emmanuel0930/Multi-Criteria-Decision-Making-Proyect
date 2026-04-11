@@ -236,6 +236,7 @@ def _build_compact_payload(
     Tamaño típico: ~180 bytes/hexágono vs ~800 bytes en GeoJSON completo
     (ahorro ~77 %).
     """
+    df = df.sort_values(by=score_column, ascending=False)
     munis = list(
         df.get("municipality", pd.Series(["—"] * len(df))).fillna("—").unique()
     )
@@ -383,7 +384,7 @@ def create_interactive_map(
     top_js = _build_top_n_js(df, score_column, top_n_highlight)
 
     # ------------------------------------------------------------------
-    # 2. Mapa base Folium — solo tiles y controles, sin datos de hexágonos
+    # 2. Mapa base Folium — solo tiles y controles
     # ------------------------------------------------------------------
     m = folium.Map(
         location=[centre_lat, centre_lon],
@@ -412,26 +413,24 @@ def create_interactive_map(
     canvas_script = f"""
 <script>
 // ── Datos generados por Python ────────────────────────────────────────────────
-// Cada fila: [verts, score, wind, slope, dist_grid, dist_roads,
-//             land_use, prot_area, conflict, rank, muni_idx, dept_idx]
-// verts = [[lat,lon]×6]  ← vértices REALES de H3, orden Leaflet
 const HEX_DATA   = {hex_data_js};
 const MUNI_TABLE = {muni_table_js};
 const DEPT_TABLE = {dept_table_js};
 const TOP_N      = {top_js};
 
-// ── Paleta RdYlGn (11 paradas) ────────────────────────────────────────────────
+// ── Paleta ────────────────────────────────────────────────────────────────────
 const PALETTE = [
   "#a50026","#d73027","#f46d43","#fdae61","#fee08b",
   "#ffffbf",
   "#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"
 ];
+
 function scoreToColor(s) {{
   const i = Math.min(10, Math.floor(Math.max(0, s) * 10.999));
   return PALETTE[i];
 }}
 
-// ── Canvas renderer de Leaflet (dibuja sobre <canvas>, no SVG) ────────────────
+// ── Canvas renderer ───────────────────────────────────────────────────────────
 const canvasRenderer = L.canvas({{ padding: 0.3 }});
 
 // ── Estado ────────────────────────────────────────────────────────────────────
@@ -445,46 +444,59 @@ function getLeafletMap() {{
   return null;
 }}
 
-// ── Renderizar solo hexágonos dentro del viewport ─────────────────────────────
+// ── Render optimizado por zoom ────────────────────────────────────────────────
 function renderViewport() {{
   const map = getLeafletMap();
   if (!map) return;
+
+  const zoom = map.getZoom();
+  const isLowZoom = zoom <= 2;
 
   const bounds = map.getBounds().pad(0.15);
   const minLat = bounds.getSouth(), maxLat = bounds.getNorth();
   const minLon = bounds.getWest(),  maxLon = bounds.getEast();
 
-  // Eliminar capa anterior del mapa y del array
+  // Limpiar mapa
   for (const p of activePolygons) map.removeLayer(p);
   activePolygons = [];
 
-  for (const row of HEX_DATA) {{
-    // Desestructurar: índice 0 = vértices reales [[lat,lon]×6]
+  // Control por zoom (OPTIMIZACIÓN CLAVE)
+  let dataToRender = HEX_DATA;
+
+  if (zoom <= 2) {{
+    dataToRender = HEX_DATA.slice(0, 3000);
+  }} else if (zoom <= 4) {{
+    dataToRender = HEX_DATA.slice(0, 8000);
+  }}
+
+  for (const row of dataToRender) {{
+
     const [verts, score, ws, slope, dg, dr, lu, pa, cr, rank, muniIdx, deptIdx] = row;
 
-    // Culling por centroide aproximado (media de verts) — evita calcular bbox por celda
     const clat = (verts[0][0] + verts[3][0]) / 2;
     const clon = (verts[1][1] + verts[4][1]) / 2;
+
     if (clat < minLat || clat > maxLat || clon < minLon || clon > maxLon) continue;
 
     const color   = scoreToColor(score);
     const opacity = 0.2 + 0.55 * score;
 
     const poly = L.polygon(verts, {{
-      renderer:    canvasRenderer,
-      fillColor:   color,
+      renderer: canvasRenderer,
+      fillColor: color,
       fillOpacity: opacity,
-      color:       "rgba(0,0,0,0.05)",
-      weight:      0.4,
-      interactive: true,
+      color: "rgba(0,0,0,0.05)",
+      weight: 0.4,
+      interactive: !isLowZoom,
     }});
 
-    // Popup construido solo al hacer click (no hay N tooltips en el DOM)
     poly.on("click", function(e) {{
       if (activePopup) activePopup.remove();
+
       const rankStr = rank > 0
         ? `<b style="color:#c0392b;font-size:14px;">★ Ranking #${{rank}}</b><br>`
         : "";
+
       const html =
         `<div style="font-family:sans-serif;font-size:12px;min-width:210px;line-height:1.8">
           ${{rankStr}}
@@ -499,6 +511,7 @@ function renderViewport() {{
           <b>Área protegida:</b> ${{pa.toFixed(3)}}<br>
           <b>Riesgo conflicto:</b> ${{cr.toFixed(3)}}<br>
         </div>`;
+
       activePopup = L.popup({{ maxWidth: 280, closeButton: true }})
         .setLatLng(e.latlng)
         .setContent(html)
@@ -509,19 +522,21 @@ function renderViewport() {{
     activePolygons.push(poly);
   }}
 
-  console.log(`[HexGrid] ${{activePolygons.length}} hexágonos en viewport`);
+  console.log(`[HexGrid] ${{activePolygons.length}} hexágonos en viewport | zoom=${{zoom}}`);
 }}
 
 // ── Marcadores Top-N ──────────────────────────────────────────────────────────
 function addTopMarkers() {{
   const map = getLeafletMap();
   if (!map) return;
+
   for (const t of TOP_N) {{
     const icon = L.divIcon({{
       html: `<div style="font-size:22px;color:#c0392b;text-shadow:0 0 4px #fff;
                          line-height:1;cursor:pointer;">★</div>`,
       iconSize: [26, 26], iconAnchor: [13, 13], className: ""
     }});
+
     const html =
       `<div style="font-family:sans-serif;font-size:13px;min-width:180px;line-height:1.7">
         <b style="font-size:15px;">★ #${{t.rank}}</b><br>
@@ -530,6 +545,7 @@ function addTopMarkers() {{
         <b>Municipio:</b> ${{t.muni}}<br>
         <b>Departamento:</b> ${{t.dept}}
       </div>`;
+
     L.marker([t.lat, t.lon], {{ icon }})
       .bindPopup(html, {{ maxWidth: 240 }})
       .bindTooltip(`#${{t.rank}} · Score ${{t.score.toFixed(3)}}`)
@@ -541,8 +557,10 @@ function addTopMarkers() {{
 function init() {{
   const map = getLeafletMap();
   if (!map) {{ setTimeout(init, 150); return; }}
+
   renderViewport();
   addTopMarkers();
+
   map.on("moveend zoomend", renderViewport);
 }}
 
@@ -666,7 +684,7 @@ if __name__ == "__main__":
     _OUT    = os.path.join(_HERE, "..", "outputs")
     os.makedirs(_OUT, exist_ok=True)
 
-    grid      = generate_colombia_hex_grid(_GEOJSON, resolution=5)
+    grid      = generate_colombia_hex_grid(_GEOJSON, resolution=4)
     feats     = engineer_features(grid)
     norm_df   = normalise_features(feats)
     norm_cols = get_norm_feature_names()
