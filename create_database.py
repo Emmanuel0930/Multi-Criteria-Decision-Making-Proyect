@@ -10,10 +10,15 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "hexagon_features.db")
 GEOJSON = os.path.join(DATA_DIR, "colombia_boundary.geojson")
+MUNICIPIOS = os.path.join(DATA_DIR, "DIVIPOLA_CentrosPoblados.csv")
 
 print("Generando grid...")
 
-hex_grid = generate_colombia_hex_grid(GEOJSON, resolution=7)
+hex_grid = generate_colombia_hex_grid(
+    GEOJSON,
+    resolution=7,
+    municipios_path=MUNICIPIOS,
+)
 
 print("Hexágonos generados:", len(hex_grid))
 

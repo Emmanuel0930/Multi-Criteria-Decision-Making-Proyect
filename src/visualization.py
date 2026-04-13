@@ -550,6 +550,53 @@ def create_interactive_map(
   .detail-cell .dc-label {{ font-size: 10px; color: #475569; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.6px; }}
   .detail-cell .dc-value {{ font-size: 13px; font-weight: 600; color: #e2e8f0; }}
 
+  .cmp-section {{ margin-top: 14px; }}
+  .cmp-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 8px;
+  }}
+  .cmp-title {{
+    font-size: 10px; font-weight: 600; letter-spacing: 1.3px;
+    text-transform: uppercase; color: #64748b;
+  }}
+  .cmp-actions {{ display: flex; gap: 6px; }}
+  .cmp-btn {{
+    border: 1px solid #1e2a3a; background: #141d29; color: #94a3b8;
+    border-radius: 6px; font-size: 11px; font-weight: 600;
+    padding: 5px 8px; cursor: pointer;
+  }}
+  .cmp-btn:hover {{ background: #1b2735; color: #cbd5e1; }}
+  .cmp-btn.primary {{ border-color: #1e40af; color: #93c5fd; }}
+  .cmp-input, .cmp-select {{
+    width: 100%;
+    border: 1px solid #1e2a3a;
+    background: #0f1724;
+    color: #cbd5e1;
+    border-radius: 6px;
+    font-size: 11px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+  }}
+  .cmp-row {{ display: flex; gap: 6px; margin-bottom: 6px; }}
+  .cmp-row .cmp-btn {{ flex: 1; }}
+  .cmp-hint {{ font-size: 10px; color: #64748b; margin-bottom: 8px; }}
+  .cmp-toggle {{ display: flex; align-items: center; gap: 6px; margin: 4px 0 8px; color: #94a3b8; font-size: 11px; }}
+  .cmp-toggle input {{ accent-color: #3b82f6; }}
+  .cmp-table {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
+  .cmp-table th {{
+    font-size: 10px; color: #64748b; text-transform: uppercase;
+    letter-spacing: 0.7px; font-weight: 600; text-align: left;
+    padding: 6px 4px; border-bottom: 1px solid #1e2a3a;
+  }}
+  .cmp-table td {{
+    font-size: 11px; color: #cbd5e1; padding: 6px 4px;
+    border-bottom: 1px solid #182233;
+  }}
+  .cmp-score {{ font-weight: 700; color: #67e8f9; }}
+  .cmp-best {{ color: #4ade80; font-weight: 700; }}
+  .cmp-empty {{ font-size: 11px; color: #475569; margin-top: 6px; }}
+  .cmp-group-chip {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }}
+
   #rp-placeholder {{
     flex: 1; display: flex; flex-direction: column;
     align-items: center; justify-content: center;
@@ -670,6 +717,46 @@ def create_interactive_map(
 
         <hr class="rp-divider">
         <div class="detail-grid" id="rp-detail-grid"></div>
+
+        <div class="cmp-section">
+          <div class="cmp-head">
+            <div class="cmp-title">Grupos de Cuadriculas</div>
+          </div>
+
+          <input id="grp-name" class="cmp-input" type="text" placeholder="Nombre del grupo (ej: Norte Viento Alto)">
+          <div class="cmp-row">
+            <button id="grp-create" class="cmp-btn primary">Crear grupo</button>
+          </div>
+
+          <select id="grp-active" class="cmp-select"></select>
+          <div class="cmp-row">
+            <button id="grp-add-current" class="cmp-btn primary">Agregar seleccion actual</button>
+            <button id="grp-remove-current" class="cmp-btn">Quitar actual</button>
+          </div>
+          <label class="cmp-toggle">
+            <input id="grp-auto-add" type="checkbox" checked>
+            Auto agregar al grupo activo al hacer clic
+          </label>
+          <div class="cmp-row">
+            <button id="grp-clear" class="cmp-btn">Vaciar grupo</button>
+            <button id="grp-delete" class="cmp-btn">Eliminar grupo</button>
+          </div>
+
+          <div class="cmp-hint">Compara grupos por score promedio y mejor celda.</div>
+          <div id="grp-empty" class="cmp-empty">Crea al menos un grupo y agrega cuadriculas para comparar.</div>
+          <table id="grp-table" class="cmp-table" style="display:none;">
+            <thead>
+              <tr>
+                <th>Grupo</th>
+                <th>#</th>
+                <th>Prom</th>
+                <th>Mejor</th>
+                <th>Estado</th>
+              </tr>
+            </thead>
+            <tbody id="grp-body"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -733,6 +820,11 @@ var canvasRenderer = L.canvas({{ padding: 0.5 }});
 var activeLayers  = [];
 var renderTimer   = null;
 var selectedLayer = null;
+var currentHex    = null;
+var groups       = {{}};
+var groupOrder   = [];
+var activeGroup  = '';
+var GROUP_COLORS = ['#38bdf8', '#a78bfa', '#f59e0b', '#34d399', '#fb7185', '#f97316', '#22d3ee'];
 
 function getLeafletMap() {{
   for (var k in window) {{
@@ -741,12 +833,168 @@ function getLeafletMap() {{
   return null;
 }}
 
+function buildHexId(lat, lon) {{
+  return 'IDX-H3-' + Math.abs(Math.round(lat * 10000 + lon * 1000)).toString().padStart(5, '0');
+}}
+
+function getGroupColor(name) {{
+  var idx = groupOrder.indexOf(name);
+  if (idx < 0) return '#64748b';
+  return GROUP_COLORS[idx % GROUP_COLORS.length];
+}}
+
+function findGroupForHex(hexId) {{
+  for (var i = 0; i < groupOrder.length; i++) {{
+    var name = groupOrder[i];
+    var items = groups[name].items;
+    for (var j = 0; j < items.length; j++) {{
+      if (items[j].hexId === hexId) return name;
+    }}
+  }}
+  return null;
+}}
+
+function renderGroupSelector() {{
+  var sel = document.getElementById('grp-active');
+  if (!sel) return;
+  var html = '';
+  if (!groupOrder.length) {{
+    html = '<option value="">Sin grupos</option>';
+    activeGroup = '';
+  }} else {{
+    for (var i = 0; i < groupOrder.length; i++) {{
+      var g = groupOrder[i];
+      var selected = (g === activeGroup) ? ' selected' : '';
+      html += '<option value="' + g + '"' + selected + '>' + g + ' (' + groups[g].items.length + ')</option>';
+    }}
+    if (!activeGroup || !groups[activeGroup]) activeGroup = groupOrder[0];
+  }}
+  sel.innerHTML = html;
+  sel.value = activeGroup;
+}}
+
+function renderGroupCompareTable() {{
+  var table = document.getElementById('grp-table');
+  var body = document.getElementById('grp-body');
+  var empty = document.getElementById('grp-empty');
+  if (!table || !body || !empty) return;
+
+  var rows = [];
+  for (var i = 0; i < groupOrder.length; i++) {{
+    var name = groupOrder[i];
+    var items = groups[name].items;
+    if (!items.length) continue;
+    var sum = 0;
+    var best = items[0].score;
+    for (var j = 0; j < items.length; j++) {{
+      sum += items[j].score;
+      if (items[j].score > best) best = items[j].score;
+    }}
+    rows.push({{
+      name: name,
+      count: items.length,
+      avg: sum / items.length,
+      best: best,
+      color: getGroupColor(name),
+    }});
+  }}
+
+  if (!rows.length) {{
+    table.style.display = 'none';
+    empty.style.display = 'block';
+    body.innerHTML = '';
+    return;
+  }}
+
+  var winner = rows[0].avg;
+  for (var k = 1; k < rows.length; k++) if (rows[k].avg > winner) winner = rows[k].avg;
+
+  table.style.display = 'table';
+  empty.style.display = 'none';
+
+  var html = '';
+  for (var r = 0; r < rows.length; r++) {{
+    var row = rows[r];
+    var isBest = Math.abs(row.avg - winner) < 1e-9;
+    var state = isBest ? '<span class="cmp-best">MEJOR</span>' : '<span>-</span>';
+    html +=
+      '<tr>' +
+        '<td><span class="cmp-group-chip" style="background:' + row.color + '"></span>' + row.name + '</td>' +
+        '<td>' + row.count + '</td>' +
+        '<td class="cmp-score">' + row.avg.toFixed(4) + '</td>' +
+        '<td>' + row.best.toFixed(4) + '</td>' +
+        '<td>' + state + '</td>' +
+      '</tr>';
+  }}
+  body.innerHTML = html;
+  renderGroupSelector();
+}}
+
+function createGroup() {{
+  var input = document.getElementById('grp-name');
+  if (!input) return;
+  var name = (input.value || '').trim();
+  if (!name) return;
+  if (!groups[name]) {{
+    groups[name] = {{ name: name, items: [] }};
+    groupOrder.push(name);
+  }}
+  activeGroup = name;
+  input.value = '';
+  renderGroupCompareTable();
+  renderViewport();
+}}
+
+function addCurrentToActiveGroup() {{
+  if (!currentHex || !activeGroup || !groups[activeGroup]) return;
+  var items = groups[activeGroup].items;
+  for (var i = 0; i < items.length; i++) {{
+    if (items[i].hexId === currentHex.hexId) return;
+  }}
+  items.push(currentHex);
+  renderGroupCompareTable();
+  renderViewport();
+}}
+
+function removeCurrentFromActiveGroup() {{
+  if (!currentHex || !activeGroup || !groups[activeGroup]) return;
+  var items = groups[activeGroup].items;
+  groups[activeGroup].items = items.filter(function(it) {{ return it.hexId !== currentHex.hexId; }});
+  renderGroupCompareTable();
+  renderViewport();
+}}
+
+function clearActiveGroup() {{
+  if (!activeGroup || !groups[activeGroup]) return;
+  groups[activeGroup].items = [];
+  renderGroupCompareTable();
+  renderViewport();
+}}
+
+function deleteActiveGroup() {{
+  if (!activeGroup || !groups[activeGroup]) return;
+  delete groups[activeGroup];
+  groupOrder = groupOrder.filter(function(g) {{ return g !== activeGroup; }});
+  activeGroup = groupOrder.length ? groupOrder[0] : '';
+  renderGroupCompareTable();
+  renderViewport();
+}}
+
 // DSS Right panel
 function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat, lon) {{
   document.getElementById('rp-placeholder').style.display = 'none';
   document.getElementById('rp-content').style.display = 'block';
 
-  var hexId = 'IDX-H3-' + Math.abs(Math.round(lat * 10000 + lon * 1000)).toString().padStart(5, '0');
+  var hexId = buildHexId(lat, lon);
+  currentHex = {{
+    hexId: hexId,
+    score: score,
+    muni: (MUNI_TABLE[mi] || '-'),
+    dept: (DEPT_TABLE[di] || '-'),
+    rank: rank,
+    lat: lat,
+    lon: lon
+  }};
   document.getElementById('rp-hex-id').textContent = hexId;
 
   document.getElementById('rp-score-value').textContent = (score * 10).toFixed(1);
@@ -792,19 +1040,37 @@ function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat
     '<div class="detail-cell"><div class="dc-label">Riesgo</div><div class="dc-value">' + cr.toFixed(3) + '</div></div>';
 
   document.getElementById('rp-close').style.display = 'block';
+  var autoAdd = document.getElementById('grp-auto-add');
+  if (autoAdd && autoAdd.checked) addCurrentToActiveGroup();
 }}
 
 function hideHexAnalysis() {{
   document.getElementById('rp-placeholder').style.display = 'flex';
   document.getElementById('rp-content').style.display = 'none';
   document.getElementById('rp-close').style.display = 'none';
+  currentHex = null;
   if (selectedLayer && selectedLayer.setStyle) {{
-    selectedLayer.setStyle({{ color: "rgba(0,0,0,0.1)", weight: 0.6 }});
+    selectedLayer.setStyle({{
+      color: selectedLayer._baseColor || "rgba(0,0,0,0.1)",
+      weight: selectedLayer._baseWeight || 0.6,
+    }});
   }}
   selectedLayer = null;
 }}
 
 document.getElementById('rp-close').addEventListener('click', hideHexAnalysis);
+document.getElementById('grp-create').addEventListener('click', createGroup);
+document.getElementById('grp-add-current').addEventListener('click', addCurrentToActiveGroup);
+document.getElementById('grp-remove-current').addEventListener('click', removeCurrentFromActiveGroup);
+document.getElementById('grp-clear').addEventListener('click', clearActiveGroup);
+document.getElementById('grp-delete').addEventListener('click', deleteActiveGroup);
+document.getElementById('grp-active').addEventListener('change', function(e) {{
+  activeGroup = e.target.value || '';
+  renderViewport();
+}});
+document.getElementById('grp-name').addEventListener('keydown', function(e) {{
+  if (e.key === 'Enter') createGroup();
+}});
 
 // LOD renderers
 function renderCircles(map, data, bounds, radius, interactive) {{
@@ -816,19 +1082,29 @@ function renderCircles(map, data, bounds, radius, interactive) {{
     var rank = row[3]||0, mi = row[4]||0, di = row[5]||0;
     var ws = row[6]||0, slope = row[7]||0, dg = row[8]||0;
     var dr = row[9]||0, lu = row[10]||0, pa = row[11]||0, cr = row[12]||0;
+    var hexId = buildHexId(lat, lon);
+    var groupName = findGroupForHex(hexId);
+    var groupColor = groupName ? getGroupColor(groupName) : null;
     if (lat < sw.lat || lat > ne.lat || lon < sw.lng || lon > ne.lng) continue;
-    (function(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr) {{
+    (function(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr, groupColor) {{
+      var baseColor = groupColor || (interactive ? "rgba(255,255,255,0.15)" : "none");
+      var baseWeight = groupColor ? 1.8 : (interactive ? 0.5 : 0);
       var cm = L.circleMarker([lat, lon], {{
         renderer: canvasRenderer, radius: radius,
         fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
-        color: interactive ? "rgba(255,255,255,0.15)" : "none",
-        weight: interactive ? 0.5 : 0,
+        color: baseColor,
+        weight: baseWeight,
         interactive: interactive
       }});
+      cm._baseColor = baseColor;
+      cm._baseWeight = baseWeight;
       if (interactive) {{
         cm.on('click', function(e) {{
           if (selectedLayer && selectedLayer !== cm && selectedLayer.setStyle) {{
-            selectedLayer.setStyle({{ color: "rgba(255,255,255,0.15)", weight: 0.5 }});
+            selectedLayer.setStyle({{
+              color: selectedLayer._baseColor || "rgba(255,255,255,0.15)",
+              weight: selectedLayer._baseWeight || 0.5,
+            }});
           }}
           cm.setStyle({{ color: "#60a5fa", weight: 2 }});
           selectedLayer = cm;
@@ -837,7 +1113,7 @@ function renderCircles(map, data, bounds, radius, interactive) {{
       }}
       cm.addTo(map);
       activeLayers.push(cm);
-    }})(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr);
+    }})(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr, groupColor);
     n++;
   }}
   return n;
@@ -872,15 +1148,25 @@ function renderLOD3(map, bounds) {{
       var rank = row[9], mi = row[10], di = row[11];
       var clat = (verts[0][0] + verts[3][0]) / 2;
       var clon = (verts[1][1] + verts[4][1]) / 2;
+      var hexId = buildHexId(clat, clon);
+      var groupName = findGroupForHex(hexId);
+      var groupColor = groupName ? getGroupColor(groupName) : null;
       if (clat < sw.lat || clat > ne.lat || clon < sw.lng || clon > ne.lng) return;
+      var baseColor = groupColor || "rgba(255,255,255,0.08)";
+      var baseWeight = groupColor ? 2.0 : 0.6;
       var poly = L.polygon(verts, {{
         renderer: canvasRenderer,
         fillColor: scoreToColor(score), fillOpacity: 0.2 + 0.6 * score,
-        color: "rgba(255,255,255,0.08)", weight: 0.6, interactive: true
+        color: baseColor, weight: baseWeight, interactive: true
       }});
+      poly._baseColor = baseColor;
+      poly._baseWeight = baseWeight;
       poly.on('click', function(e) {{
         if (selectedLayer && selectedLayer !== poly && selectedLayer.setStyle) {{
-          selectedLayer.setStyle({{ color: "rgba(255,255,255,0.08)", weight: 0.6 }});
+          selectedLayer.setStyle({{
+            color: selectedLayer._baseColor || "rgba(255,255,255,0.08)",
+            weight: selectedLayer._baseWeight || 0.6,
+          }});
         }}
         poly.setStyle({{ color: "#60a5fa", weight: 2.5 }});
         selectedLayer = poly;
@@ -956,6 +1242,7 @@ function addLodHud() {{
 function init() {{
   var map = getLeafletMap();
   if (!map) {{ setTimeout(init, 150); return; }}
+  renderGroupCompareTable();
   renderViewport();
   addTopMarkers();
   addLodHud();
