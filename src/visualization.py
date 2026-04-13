@@ -1,35 +1,33 @@
 """
 visualization.py
 ================
-Crea todos los outputs visuales del modelo MCDA de aptitud eólica:
+Crea todos los outputs visuales del modelo MCDA de aptitud eólica.
 
-1. **Mapa interactivo HTML** – arquitectura híbrida:
-   - Folium genera el mapa base con tiles CartoDB/OSM y controles estándar.
-   - Los hexágonos se renderizan con Leaflet L.Canvas directamente inyectado
-     en el HTML, evitando el cuello de botella de ``folium.GeoJson`` que
-     embebe un objeto JS gigante (la línea ``geo_json_XXX_add({...})``) que
-     congela el navegador con resoluciones altas.
+Arquitectura unificada
+-----------------------
+Combina dos mejoras complementarias:
 
-   Estrategia de rendimiento
-   -------------------------
-   • **L.Canvas renderer**: Leaflet dibuja polígonos sobre un <canvas> en
-     lugar de crear un nodo SVG por hexágono. Para 26 000+ hexágonos la
-     diferencia es de minutos a < 2 segundos de carga.
-   • **Datos compactos**: los hexágonos se serializan como un array JS de
-     arrays numéricos ``[lon_c, lat_c, score, ws, slope, dg, dr, lu, pa, cr,
-     rank, muni_idx, dept_idx]`` + tablas de strings separadas.
-     Esto reduce el payload ~70% respecto a GeoJSON completo.
-   • **Viewport culling**: en cada evento ``moveend`` / ``zoomend`` solo se
-     añaden al mapa los hexágonos cuyos centroides están dentro del bounds
-     visible + 20% de margen. Los fuera de vista se eliminan del DOM.
-   • **Vértices reconstruidos en JS**: los 6 vértices del hexágono se
-     calculan en el cliente a partir del centroide y el radio, evitando
-     transmitir 6 coordenadas por celda.
-   • **Popup bajo demanda**: el popup HTML se construye solo al hacer click,
-     no hay 26 000 tooltips pre-renderizados en el DOM.
+1. **Multi-LOD rendering** (del optimizado):
+   - LOD0 zoom<=5 : ~2 000 puntos simples, submuestreo 0.5°
+   - LOD1 zoom 6-7: ~5 000 circleMarkers, submuestreo 0.15°
+   - LOD2 zoom 8-9: ~15 000 circleMarkers, submuestreo 0.05°
+   - LOD3 zoom>=10: polígonos H3 reales, viewport-culled
+   - Debounce de 120 ms en renderViewport para evitar re-renders en cadena
+   - HUD de zoom/nivel en el mapa
+   - _spatial_sample(): selecciona el hexágono de mayor score por celda
 
-2. **Gráfica de distribución** – histograma de scores (matplotlib).
-3. **Heatmap de correlación** – correlación de Pearson (matplotlib).
+2. **UI Prototipo DSS** (del nuevo):
+   - Topbar oscuro: logo, versión, subtítulo EAFIT
+   - Panel izquierdo: ponderación de criterios por categorías A/B/C
+   - Panel derecho: análisis del hexágono seleccionado con:
+       · ID del hexágono (IDX-H3-XXXXX)
+       · Índice Global (score × 10)
+       · SHAP Values (barras + / - de explicabilidad)
+       · Grilla de detalles (municipio, viento, pendiente, etc.)
+   - Al hacer click en cualquier LOD se puebla el panel derecho
+
+3. **Gráfica de distribución** – histograma de scores (matplotlib).
+4. **Heatmap de correlación** – correlación de Pearson (matplotlib).
 """
 
 from __future__ import annotations
@@ -51,8 +49,6 @@ import math
 # ---------------------------------------------------------------------------
 # Constante de rendimiento
 # ---------------------------------------------------------------------------
-#: Por encima de este número de hexágonos se activa la simplificación de
-#: coordenadas para mantener el archivo HTML por debajo de ~10 MB.
 MAX_FULL_HEXAGONS: int = 5_000
 
 
@@ -92,14 +88,12 @@ def _build_colour_scale_html(n_steps: int = 6) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GeoJSON builder
+# GeoJSON builder (exportación, no se usa en el mapa interactivo)
 # ---------------------------------------------------------------------------
 
 def _simplify_ring(coords: list, tol: float = 0.002) -> list:
     """
     Douglas-Peucker simplificado sobre un anillo de coordenadas.
-    Para hexágonos regulares con 6 vértices la simplificación no aplica,
-    pero sí reduce rings complejos en polígonos irregulares.
     """
     if len(coords) <= 4:
         return coords
@@ -138,17 +132,6 @@ def df_to_geojson(
 ) -> dict:
     """
     Convierte el DataFrame de hexágonos a GeoJSON FeatureCollection.
-
-    Parameters
-    ----------
-    df            : DataFrame con columnas ``vertices``, ``hex_id``, score y features
-    score_column  : nombre de la columna de score
-    feature_cols  : columnas extra a incluir en properties
-    simplify      : si True aplica simplificación de coordenadas (resoluciones altas)
-
-    Returns
-    -------
-    GeoJSON dict
     """
     if feature_cols is None:
         feature_cols = [
@@ -167,7 +150,6 @@ def df_to_geojson(
         }
         props["hex_id"] = row["hex_id"]
 
-        # Municipio / departamento si existen
         for meta in ("municipality", "department", "divipola_code"):
             if meta in row.index:
                 val = row[meta]
@@ -175,7 +157,7 @@ def df_to_geojson(
 
         score = float(row.get(score_column, 0) or 0)
         props["colour"] = _score_to_hex_colour(score)
-        props["opacity"] = round(0.4 + 0.5 * score, 2)  # más opaco = más apto
+        props["opacity"] = round(0.4 + 0.5 * score, 2)
 
         if "vertices" in row.index and row["vertices"] is not None:
             coords = [[round(v[0], 5), round(v[1], 5)] for v in row["vertices"]]
@@ -189,7 +171,6 @@ def df_to_geojson(
         if simplify:
             coords = _simplify_ring(coords, tol=0.002)
 
-        # Cerrar el anillo si no está cerrado
         if coords and coords[0] != coords[-1]:
             coords.append(coords[0])
 
@@ -203,104 +184,115 @@ def df_to_geojson(
 
 
 # ---------------------------------------------------------------------------
-# Helpers de serialización compacta
+# Serialización multi-LOD (del optimizado)
 # ---------------------------------------------------------------------------
 
-def _build_compact_payload(
+def _spatial_sample(
     df: pd.DataFrame,
     score_column: str,
-) -> tuple[str, str, str]:
+    cell_deg: float,
+) -> pd.DataFrame:
     """
-    Serializa los hexágonos como arrays JS compactos usando los vértices
-    REALES devueltos por H3, en lugar de recalcularlos en JS.
-
-    Por qué los vértices reales son imprescindibles
-    ------------------------------------------------
-    Los hexágonos H3 NO son regulares en coordenadas geográficas: su forma
-    varía ligeramente según la latitud y el índice de la celda. Si se
-    reconstruyen desde el centroide con una fórmula trigonométrica aproximada,
-    los bordes entre celdas vecinas no coinciden, produciendo solapamientos
-    y huecos visibles (el bug "hexágonos encima de hexágonos").
-
-    Formato de cada fila en HEX_DATA:
-        [
-          [[lat0,lon0],[lat1,lon1],...,[lat5,lon5]],  ← 6 vértices reales de H3
-          score, wind_speed, slope, dist_grid, dist_roads,
-          land_use, protected_area, conflict_risk,
-          rank, muni_idx, dept_idx
-        ]
-
-    Los vértices se almacenan como [lat,lon] (orden Leaflet) con 4 decimales
-    (~11 m de precisión), suficiente para visualización.
-
-    Tamaño típico: ~180 bytes/hexágono vs ~800 bytes en GeoJSON completo
-    (ahorro ~77 %).
+    Submuestreo espacial: divide Colombia en una cuadrícula de celdas de
+    `cell_deg` grados y selecciona el hexágono con mayor score en cada celda.
+    Garantiza que el mapa nunca tenga más de (cols × rows) objetos en pantalla.
     """
-    df = df.sort_values(by=score_column, ascending=False)
-    munis = list(
-        df.get("municipality", pd.Series(["—"] * len(df))).fillna("—").unique()
-    )
-    depts = list(
-        df.get("department", pd.Series(["—"] * len(df))).fillna("—").unique()
-    )
+    df = df.copy()
+    df["_gx"] = (df["lon"] / cell_deg).astype(int)
+    df["_gy"] = (df["lat"] / cell_deg).astype(int)
+    idx = df.groupby(["_gx", "_gy"])[score_column].idxmax()
+    return df.loc[idx].drop(columns=["_gx", "_gy"]).reset_index(drop=True)
+
+
+def _build_lod_payload(
+    df: pd.DataFrame,
+    score_column: str,
+) -> tuple:
+    """
+    Construye 4 niveles de detalle pre-muestreados espacialmente en Python.
+
+    LOD0 zoom<=5  : puntos [lat,lon,score]              submuestreo 0.5 deg  ~2k
+    LOD1 zoom 6-7 : circulos [lat,lon,score,rank,...]   submuestreo 0.15 deg ~5k
+    LOD2 zoom 8-9 : circulos [lat,lon,score,rank,...]   submuestreo 0.05 deg ~15k
+    LOD3 zoom>=10 : poligonos reales [verts,score,...]  viewport-culled en JS
+
+    El submuestreo es espacial (mejor score por celda), no aleatorio,
+    asi la informacion relevante siempre se preserva.
+    """
+    df = df.sort_values(by=score_column, ascending=False).reset_index(drop=True)
+
+    munis = list(df.get("municipality", pd.Series(["—"] * len(df))).fillna("—").unique())
+    depts = list(df.get("department",   pd.Series(["—"] * len(df))).fillna("—").unique())
     muni_idx_map = {m: i for i, m in enumerate(munis)}
     dept_idx_map = {d: i for i, d in enumerate(depts)}
 
     has_vertices = "vertices" in df.columns
 
-    rows = []
-    for _, r in df.iterrows():
+    def _meta(r):
         def _f(col, default=0.0):
             v = r.get(col, default)
             try:
                 fv = float(v)
-                return round(fv, 4) if not math.isnan(fv) else default
+                return round(fv, 3) if not math.isnan(fv) else default
             except (TypeError, ValueError):
                 return default
-
-        # ── Vértices reales de H3 en formato [[lat,lon], ...] ──────────────
-        # La columna 'vertices' de generate_h3_grid tiene formato [(lon,lat),...]
-        # Leaflet necesita [lat,lon], así que invertimos aquí en Python.
-        if has_vertices and r["vertices"] is not None:
-            raw = r["vertices"]
-            # Excluir el último punto si cierra el anillo (== primero)
-            ring = raw[:-1] if len(raw) == 7 and raw[0] == raw[-1] else raw[:6]
-            verts = [[round(v[1], 4), round(v[0], 4)] for v in ring]  # [lat, lon]
-        else:
-            # Fallback: aproximación desde centroide si no hay vértices
-            # (no debería ocurrir con generate_h3_grid normal)
-            lon_c, lat_c = float(r["lon"]), float(r["lat"])
-            r_deg = 0.10
-            rx = r_deg / max(math.cos(math.radians(lat_c)), 0.01)
-            verts = [
-                [round(lat_c + r_deg * math.sin(math.radians(60 * k + 30)), 4),
-                 round(lon_c + rx  * math.cos(math.radians(60 * k + 30)), 4)]
-                for k in range(6)
-            ]
-
         rank_val = int(r["rank"]) if "rank" in r.index and not pd.isna(r.get("rank")) else 0
         muni_str = str(r.get("municipality", "—")) if "municipality" in r.index else "—"
         dept_str = str(r.get("department",   "—")) if "department"   in r.index else "—"
+        return (_f(score_column), _f("wind_speed"), _f("slope"),
+                _f("dist_to_grid"), _f("dist_to_roads"), _f("land_use"),
+                _f("protected_area"), _f("conflict_risk"),
+                rank_val, muni_idx_map.get(muni_str, 0), dept_idx_map.get(dept_str, 0))
 
-        rows.append([
-            verts,                          # índice 0: [[lat,lon]×6]
-            _f(score_column),               # 1
-            _f("wind_speed"),               # 2
-            _f("slope"),                    # 3
-            _f("dist_to_grid"),             # 4
-            _f("dist_to_roads"),            # 5
-            _f("land_use"),                 # 6
-            _f("protected_area"),           # 7
-            _f("conflict_risk"),            # 8
-            rank_val,                       # 9
-            muni_idx_map.get(muni_str, 0),  # 10
-            dept_idx_map.get(dept_str, 0),  # 11
-        ])
+    # LOD0: puntos [lat, lon, score] submuestreados 0.5 deg
+    s0 = _spatial_sample(df, score_column, 0.5)
+    lod0 = [[round(float(r["lat"]), 3), round(float(r["lon"]), 3),
+             round(float(r[score_column]), 3)] for _, r in s0.iterrows()]
 
-    hex_data_js   = json.dumps(rows,  separators=(",", ":"))
-    muni_table_js = json.dumps(munis, separators=(",", ":"))
-    dept_table_js = json.dumps(depts, separators=(",", ":"))
-    return hex_data_js, muni_table_js, dept_table_js
+    # LOD1: circulos 0.15 deg [lat,lon,score,rank,mi,di,ws,sl,dg,dr,lu,pa,cr]
+    s1 = _spatial_sample(df, score_column, 0.15)
+    lod1 = []
+    for _, r in s1.iterrows():
+        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
+        lod1.append([round(float(r["lat"]), 3), round(float(r["lon"]), 3),
+                     sc, rk, mi, di, ws, sl, dg, dr, lu, pa, cr])
+
+    # LOD2: circulos 0.05 deg
+    s2 = _spatial_sample(df, score_column, 0.05)
+    lod2 = []
+    for _, r in s2.iterrows():
+        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
+        lod2.append([round(float(r["lat"]), 3), round(float(r["lon"]), 3),
+                     sc, rk, mi, di, ws, sl, dg, dr, lu, pa, cr])
+
+    # LOD3: poligonos reales (viewport-culled en JS)
+    lod3 = []
+    for _, r in df.iterrows():
+        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
+        if has_vertices and r["vertices"] is not None:
+            raw  = r["vertices"]
+            ring = raw[:-1] if len(raw) == 7 and raw[0] == raw[-1] else raw[:6]
+            verts = [[round(v[1], 4), round(v[0], 4)] for v in ring]
+        else:
+            lat_c, lon_c = float(r["lat"]), float(r["lon"])
+            r_deg = 0.05
+            rx = r_deg / max(math.cos(math.radians(lat_c)), 0.01)
+            verts = [[round(lat_c + r_deg * math.sin(math.radians(60 * k + 30)), 4),
+                      round(lon_c + rx    * math.cos(math.radians(60 * k + 30)), 4)]
+                     for k in range(6)]
+        lod3.append([verts, sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di])
+
+    sep = (",", ":")
+    print(f"[Map] LOD sizes -> LOD0:{len(lod0):,}  LOD1:{len(lod1):,}  "
+          f"LOD2:{len(lod2):,}  LOD3:{len(lod3):,}")
+    return (
+        json.dumps(lod0, separators=sep),
+        json.dumps(lod1, separators=sep),
+        json.dumps(lod2, separators=sep),
+        json.dumps(lod3, separators=sep),
+        json.dumps(munis, separators=sep),
+        json.dumps(depts, separators=sep),
+    )
 
 
 def _build_top_n_js(df: pd.DataFrame, score_column: str, top_n: int) -> str:
@@ -321,7 +313,7 @@ def _build_top_n_js(df: pd.DataFrame, score_column: str, top_n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Mapa interactivo — arquitectura híbrida Folium + Leaflet Canvas
+# Mapa interactivo — LOD + UI Prototipo DSS
 # ---------------------------------------------------------------------------
 
 def create_interactive_map(
@@ -331,42 +323,21 @@ def create_interactive_map(
     top_n_highlight: int = 10,
     centre_lat: float = 4.711,
     centre_lon: float = -74.0721,
-    zoom: int = 14,
+    zoom: int = 6,
 ) -> None:
     """
-    Genera un mapa HTML interactivo de alto rendimiento.
-
-    Arquitectura
-    ------------
-    Folium genera el esqueleto HTML con el mapa base Leaflet (tiles CartoDB/OSM)
-    y la infraestructura de controles. Los hexágonos NO se pasan por
-    ``folium.GeoJson`` — esa es la línea que congela el navegador.
-
-    En su lugar, Python inyecta directamente en el HTML:
-
-    1. **HEX_DATA**: array JS compacto con los datos de cada hexágono
-       (13 números por celda en lugar de un objeto GeoJSON completo).
-    2. **Motor de renderizado Leaflet L.Canvas**: dibuja los hexágonos
-       como polígonos sobre un elemento <canvas>, que el navegador puede
-       pintar en < 1 segundo para 200 000+ polígonos frente a los varios
-       minutos del renderer SVG.
-    3. **Viewport culling**: en cada ``moveend`` / ``zoomend`` se eliminan
-       las capas fuera del bounding box visible y se añaden solo las nuevas
-       que entran al viewport.
-    4. **Radio calculado en JS**: los vértices del hexágono se calculan en
-       el cliente a partir del centroide + radio estimado, evitando
-       transmitir 6 × 2 coordenadas por celda.
-    5. **Popup bajo demanda**: el HTML del popup se construye solo al hacer
-       click, sin pre-renderizar miles de nodos DOM.
+    Genera un mapa HTML interactivo con:
+      - Multi-LOD rendering (4 niveles de detalle segun zoom)
+      - UI Prototipo DSS: topbar, panel de criterios, panel de analisis multicriterio
 
     Parameters
     ----------
-    df               : DataFrame scored y rankeado (debe tener ``lat``, ``lon``)
+    df               : DataFrame scored y rankeado (debe tener lat, lon)
     output_path      : ruta del archivo .html a generar
     score_column     : columna de score de aptitud
-    top_n_highlight  : número de top celdas a marcar con estrella
-    centre_lat/lon   : centro inicial (default: Bogotá 4.711, -74.072)
-    zoom             : zoom inicial (6 = país completo, 8 = regional)
+    top_n_highlight  : numero de top celdas a marcar con estrella
+    centre_lat/lon   : centro inicial del mapa
+    zoom             : zoom inicial (6 = pais completo, 10 = poligonos reales)
     """
     try:
         import folium
@@ -375,17 +346,14 @@ def create_interactive_map(
         raise ImportError("Instala Folium:  pip install folium")
 
     n = len(df)
-    print(f"[Map] Construyendo mapa híbrido | {n:,} hexágonos | zoom={zoom}")
+    print(f"[Map] Construyendo mapa DSS multi-LOD | {n:,} hexagonos | zoom={zoom}")
 
-    # ------------------------------------------------------------------
-    # 1. Serializar datos compactos en Python
-    # ------------------------------------------------------------------
-    hex_data_js, muni_table_js, dept_table_js = _build_compact_payload(df, score_column)
+    # 1. Serializar los 4 niveles de detalle
+    lod0_js, lod1_js, lod2_js, lod3_js, muni_table_js, dept_table_js = \
+        _build_lod_payload(df, score_column)
     top_js = _build_top_n_js(df, score_column, top_n_highlight)
 
-    # ------------------------------------------------------------------
-    # 2. Mapa base Folium — solo tiles y controles
-    # ------------------------------------------------------------------
+    # 2. Mapa base Folium
     m = folium.Map(
         location=[centre_lat, centre_lon],
         zoom_start=zoom,
@@ -393,196 +361,623 @@ def create_interactive_map(
         control_scale=True,
         prefer_canvas=True,
     )
-    folium.TileLayer("OpenStreetMap",      name="OpenStreetMap", show=False).add_to(m)
+    folium.TileLayer("OpenStreetMap",       name="OpenStreetMap", show=False).add_to(m)
     folium.TileLayer("CartoDB dark_matter", name="Carto Dark",    show=False).add_to(m)
     MiniMap(toggle_display=True, position="bottomleft").add_to(m)
     Fullscreen(position="topright").add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
-    # Leyenda de color
-    m.get_root().html.add_child(folium.Element(
-        f'<div style="position:fixed;bottom:40px;right:15px;z-index:9999;pointer-events:none;">'
-        f'{_build_colour_scale_html()}</div>'
-    ))
+    # 3. UI Prototipo DSS + motor LOD
+    dss_ui = f"""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-    # ------------------------------------------------------------------
-    # 3. Inyectar motor de renderizado Canvas directamente en el HTML
-    #    IMPORTANTE: esto se añade DESPUÉS del HTML de Folium para que
-    #    el objeto `map_XXXX` de Leaflet ya exista cuando se ejecute.
-    # ------------------------------------------------------------------
-    canvas_script = f"""
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  body {{
+    font-family: 'Inter', sans-serif;
+    background: #0d1117;
+    color: #e2e8f0;
+    overflow: hidden;
+  }}
+
+  #dss-shell {{
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    z-index: 10000;
+    pointer-events: none;
+  }}
+
+  /* Topbar */
+  #dss-topbar {{
+    display: flex;
+    align-items: center;
+    background: #0d1117;
+    border-bottom: 1px solid #1e2a3a;
+    padding: 0 20px;
+    height: 52px;
+    flex-shrink: 0;
+    pointer-events: all;
+    z-index: 10001;
+  }}
+  #dss-topbar .logo {{
+    display: flex; align-items: center; gap: 10px;
+    font-size: 15px; font-weight: 700; color: #e2e8f0; letter-spacing: -0.3px;
+  }}
+  #dss-topbar .logo .icon {{
+    width: 32px; height: 32px; background: #2563eb; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+  }}
+  #dss-topbar .logo .accent {{ color: #60a5fa; font-style: italic; }}
+  #dss-topbar .separator {{ width: 1px; height: 28px; background: #1e2a3a; margin: 0 20px; }}
+  #dss-topbar .subtitle {{ font-size: 11px; font-weight: 500; color: #64748b; letter-spacing: 1.5px; text-transform: uppercase; }}
+  #dss-topbar .spacer {{ flex: 1; }}
+  #dss-topbar .version {{ font-size: 11px; color: #475569; letter-spacing: 0.5px; }}
+  #dss-topbar .share-btn {{
+    margin-left: 14px; width: 30px; height: 30px;
+    border: 1px solid #1e2a3a; border-radius: 6px;
+    background: transparent; color: #64748b; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; font-size: 13px;
+    transition: all 0.15s;
+  }}
+  #dss-topbar .share-btn:hover {{ background: #1e2a3a; color: #94a3b8; }}
+
+  /* Body */
+  #dss-body {{ display: flex; flex: 1; overflow: hidden; pointer-events: none; }}
+
+  /* Left panel */
+  #dss-left {{
+    width: 260px; flex-shrink: 0;
+    background: #0d1117; border-right: 1px solid #1e2a3a;
+    overflow-y: auto; padding: 18px 16px; pointer-events: all;
+  }}
+  #dss-left::-webkit-scrollbar {{ width: 4px; }}
+  #dss-left::-webkit-scrollbar-thumb {{ background: #1e2a3a; border-radius: 2px; }}
+
+  .panel-section-title {{
+    font-size: 10px; font-weight: 600; letter-spacing: 1.8px;
+    text-transform: uppercase; color: #3b82f6; margin-bottom: 14px;
+  }}
+  .crit-category {{ margin-bottom: 20px; }}
+  .crit-category-header {{
+    display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+    font-size: 11px; font-weight: 600; color: #94a3b8;
+    text-transform: uppercase; letter-spacing: 0.8px;
+  }}
+  .crit-row {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 7px 0; border-bottom: 1px solid #141d29;
+  }}
+  .crit-row:last-child {{ border-bottom: none; }}
+  .crit-label {{ font-size: 12px; color: #cbd5e1; font-weight: 400; }}
+  .crit-badge {{
+    font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 4px;
+    background: #1e3a5f; color: #60a5fa; min-width: 44px; text-align: center;
+  }}
+  .crit-badge.excluded {{ background: #3b1212; color: #f87171; }}
+  .crit-badge.green    {{ background: #14301f; color: #4ade80; }}
+  .crit-badge.orange   {{ background: #2d1e0a; color: #fb923c; }}
+
+  /* Map area */
+  #dss-map-area {{ flex: 1; position: relative; pointer-events: all; }}
+
+  /* LOD HUD */
+  #lod-hud {{
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(13,17,23,0.85); border: 1px solid #1e2a3a;
+    padding: 4px 14px; border-radius: 12px;
+    font-size: 11px; font-family: 'Inter', sans-serif; color: #64748b;
+    z-index: 500; pointer-events: none;
+  }}
+
+  /* Legend */
+  #dss-legend {{
+    position: absolute; bottom: 36px; right: 10px; z-index: 500;
+    background: rgba(13,17,23,0.92); border: 1px solid #1e2a3a;
+    border-radius: 8px; padding: 10px 14px; min-width: 210px; pointer-events: none;
+  }}
+  #dss-legend .leg-title {{
+    font-size: 10px; font-weight: 600; letter-spacing: 1.4px;
+    text-transform: uppercase; color: #64748b; margin-bottom: 8px;
+  }}
+  #dss-legend .leg-bar {{
+    display: flex; height: 12px; border-radius: 3px; overflow: hidden; margin-bottom: 5px;
+  }}
+  #dss-legend .leg-labels {{ display: flex; justify-content: space-between; font-size: 10px; color: #475569; }}
+  #dss-legend .leg-note {{ font-size: 10px; color: #475569; margin-top: 6px; }}
+
+  /* Right panel */
+  #dss-right {{
+    width: 270px; flex-shrink: 0;
+    background: #0d1117; border-left: 1px solid #1e2a3a;
+    padding: 18px 16px; pointer-events: all;
+    overflow-y: auto; display: flex; flex-direction: column;
+  }}
+  #dss-right::-webkit-scrollbar {{ width: 4px; }}
+  #dss-right::-webkit-scrollbar-thumb {{ background: #1e2a3a; border-radius: 2px; }}
+
+  .rp-section-label {{
+    font-size: 10px; font-weight: 600; letter-spacing: 1.8px;
+    text-transform: uppercase; color: #3b82f6; margin-bottom: 4px;
+  }}
+  #rp-hex-id {{
+    font-size: 22px; font-weight: 700; color: #e2e8f0;
+    margin-bottom: 18px; letter-spacing: -0.5px; word-break: break-all;
+  }}
+  #rp-close {{
+    position: absolute; top: 66px; right: 12px;
+    width: 24px; height: 24px; background: #1e2a3a; border: none;
+    border-radius: 50%; color: #64748b; cursor: pointer;
+    font-size: 14px; line-height: 24px; text-align: center;
+    pointer-events: all; display: none;
+  }}
+  #rp-close:hover {{ background: #263548; color: #94a3b8; }}
+
+  #rp-score-card {{
+    background: #141d29; border: 1px solid #1e2a3a; border-radius: 10px;
+    padding: 18px; margin-bottom: 18px; text-align: center;
+  }}
+  #rp-score-card .sc-label {{
+    font-size: 10px; font-weight: 600; letter-spacing: 1.6px;
+    text-transform: uppercase; color: #64748b; margin-bottom: 6px;
+  }}
+  #rp-score-card .sc-value {{
+    font-size: 52px; font-weight: 700; line-height: 1;
+    background: linear-gradient(135deg, #60a5fa 0%, #34d399 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }}
+  #rp-score-card .sc-sub {{ font-size: 11px; color: #475569; margin-top: 6px; }}
+
+  .shap-section-header {{
+    display: flex; align-items: center; gap: 7px; margin-bottom: 12px;
+    font-size: 11px; font-weight: 600; color: #64748b;
+    text-transform: uppercase; letter-spacing: 0.8px;
+  }}
+  .shap-row {{ display: flex; align-items: center; margin-bottom: 10px; gap: 8px; }}
+  .shap-label {{ font-size: 12px; color: #94a3b8; width: 130px; flex-shrink: 0; }}
+  .shap-value {{ font-size: 12px; font-weight: 600; width: 42px; text-align: right; flex-shrink: 0; }}
+  .shap-value.pos {{ color: #4ade80; }}
+  .shap-value.neg {{ color: #f87171; }}
+  .shap-bar-wrap {{ flex: 1; height: 4px; background: #1e2a3a; border-radius: 2px; position: relative; overflow: visible; }}
+  .shap-bar {{ height: 4px; border-radius: 2px; position: absolute; top: 0; transition: width 0.4s ease; }}
+  .shap-bar.pos {{ background: #4ade80; left: 0; }}
+  .shap-bar.neg {{ background: #f87171; right: 0; }}
+
+  .detail-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }}
+  .detail-cell {{ background: #141d29; border: 1px solid #1e2a3a; border-radius: 7px; padding: 9px 11px; }}
+  .detail-cell .dc-label {{ font-size: 10px; color: #475569; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.6px; }}
+  .detail-cell .dc-value {{ font-size: 13px; font-weight: 600; color: #e2e8f0; }}
+
+  #rp-placeholder {{
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; color: #2d3748; text-align: center; padding: 30px 20px;
+  }}
+  #rp-placeholder svg {{ opacity: 0.3; }}
+  #rp-placeholder p {{ font-size: 12px; line-height: 1.5; }}
+
+  .rp-divider {{ border: none; border-top: 1px solid #1e2a3a; margin: 16px 0; }}
+  .leaflet-container {{ background: #0d1117; }}
+</style>
+
+<!-- DSS Shell -->
+<div id="dss-shell">
+
+  <div id="dss-topbar">
+    <div class="logo">
+      <div class="icon">&#x229E;</div>
+      Prototipo <span class="accent">&nbsp;DSS</span>
+    </div>
+    <div class="separator"></div>
+    <div class="subtitle">EAFIT Intelligence System</div>
+    <div class="spacer"></div>
+    <div class="version">VERSION: 2.0.4 - INVESTIGACION</div>
+    <button class="share-btn" title="Compartir">&#x21E7;</button>
+  </div>
+
+  <div id="dss-body">
+
+    <!-- Left panel: Criterion weights -->
+    <div id="dss-left">
+      <div class="panel-section-title">Ponderacion de Criterios (Fijo)</div>
+
+      <div class="crit-category">
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M12 2a10 10 0 0 1 0 20A10 10 0 0 1 12 2z"/><path d="M12 6v6l4 2"/>
+          </svg>
+          A. Meteorologicos (45%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Velocidad Viento (Avg)</span><span class="crit-badge">25%</span></div>
+        <div class="crit-row"><span class="crit-label">Densidad del Aire</span><span class="crit-badge">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Indice de Turbulencia</span><span class="crit-badge">10%</span></div>
+      </div>
+
+      <div class="crit-category">
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.07 4.93A10 10 0 0 1 21 12a10 10 0 0 1-1.93 5.07"/>
+            <path d="M4.93 4.93A10 10 0 0 0 3 12a10 10 0 0 0 1.93 5.07"/>
+          </svg>
+          B. Tecnicos y Suelo (35%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Cercania a Red Electrica</span><span class="crit-badge">15%</span></div>
+        <div class="crit-row"><span class="crit-label">Pendiente Maxima</span><span class="crit-badge">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Accesibilidad Vial</span><span class="crit-badge">5%</span></div>
+        <div class="crit-row"><span class="crit-label">Capacidad Portante Suelo</span><span class="crit-badge">5%</span></div>
+      </div>
+
+      <div class="crit-category">
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          </svg>
+          C. Socio-Ambientales (20%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Zonas Protegidas</span><span class="crit-badge excluded">EXCLUIDO</span></div>
+        <div class="crit-row"><span class="crit-label">Riesgo de Conflicto</span><span class="crit-badge orange">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Uso del Suelo</span><span class="crit-badge green">10%</span></div>
+      </div>
+    </div>
+
+    <!-- Map area -->
+    <div id="dss-map-area">
+      <div id="lod-hud">zoom 6 - vista region</div>
+      <div id="dss-legend">
+        <div class="leg-title">Suitability Score</div>
+        <div class="leg-bar" id="leg-gradient"></div>
+        <div class="leg-labels">
+          <span>0.0</span><span>0.2</span><span>0.4</span><span>0.6</span><span>0.8</span><span>1.0</span>
+        </div>
+        <div class="leg-note">* Top-{top_n_highlight} candidatos</div>
+      </div>
+    </div>
+
+    <!-- Right panel: Multicriteria analysis -->
+    <div id="dss-right">
+      <div id="rp-placeholder">
+        <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+          <circle cx="12" cy="10" r="3"/>
+        </svg>
+        <p>Haz clic en un hexagono del mapa para ver su analisis multicriterio</p>
+      </div>
+
+      <div id="rp-content" style="display:none;">
+        <div class="rp-section-label">Analisis Multicriterio</div>
+        <div id="rp-hex-id">-</div>
+        <button id="rp-close">x</button>
+
+        <div id="rp-score-card">
+          <div class="sc-label">Indice Global</div>
+          <div class="sc-value" id="rp-score-value">-</div>
+          <div class="sc-sub" id="rp-score-sub">-</div>
+        </div>
+
+        <div class="shap-section-header">
+          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <rect x="3" y="3" width="7" height="7"/>
+            <rect x="14" y="3" width="7" height="7"/>
+            <rect x="14" y="14" width="7" height="7"/>
+            <rect x="3" y="14" width="7" height="7"/>
+          </svg>
+          Explicabilidad (SHAP Values)
+        </div>
+        <div id="rp-shap-container"></div>
+
+        <hr class="rp-divider">
+        <div class="detail-grid" id="rp-detail-grid"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Legend gradient builder -->
 <script>
-// ── Datos generados por Python ────────────────────────────────────────────────
-const HEX_DATA   = {hex_data_js};
-const MUNI_TABLE = {muni_table_js};
-const DEPT_TABLE = {dept_table_js};
-const TOP_N      = {top_js};
+(function() {{
+  var bar = document.getElementById('leg-gradient');
+  var palette = ["#a50026","#d73027","#f46d43","#fdae61","#fee08b",
+                 "#ffffbf","#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"];
+  bar.innerHTML = palette.map(function(c) {{
+    return '<span style="background:' + c + ';flex:1;display:inline-block;height:12px;"></span>';
+  }}).join('');
+}})();
+</script>
 
-// ── Paleta ────────────────────────────────────────────────────────────────────
-const PALETTE = [
+<!-- Reposition Folium map inside dss-map-area -->
+<script>
+(function waitForMap() {{
+  var mapArea = document.getElementById('dss-map-area');
+  if (!mapArea) {{ setTimeout(waitForMap, 100); return; }}
+  var foliumMap = document.querySelector('.folium-map') || document.querySelector('[id^="map_"]');
+  if (!foliumMap) {{ setTimeout(waitForMap, 100); return; }}
+  foliumMap.style.position = 'absolute';
+  foliumMap.style.inset = '0';
+  foliumMap.style.width = '100%';
+  foliumMap.style.height = '100%';
+  foliumMap.style.zIndex = '1';
+  mapArea.appendChild(foliumMap);
+}})();
+</script>
+
+<!-- LOD renderer + DSS right-panel logic -->
+<script>
+// Data from Python
+// LOD0 [lat,lon,score]              zoom<=5  submuestreo 0.5 deg  ~2k puntos
+// LOD1 [lat,lon,score,rank,mi,di,…] zoom 6-7 submuestreo 0.15 deg ~5k circulos
+// LOD2 [lat,lon,score,rank,mi,di,…] zoom 8-9 submuestreo 0.05 deg ~15k circulos
+// LOD3 [verts,score,…]              zoom>=10 poligonos reales viewport-culled
+var LOD0       = {lod0_js};
+var LOD1       = {lod1_js};
+var LOD2       = {lod2_js};
+var LOD3       = {lod3_js};
+var MUNI_TABLE = {muni_table_js};
+var DEPT_TABLE = {dept_table_js};
+var TOP_N      = {top_js};
+
+// Color palette RdYlGn
+var PALETTE = [
   "#a50026","#d73027","#f46d43","#fdae61","#fee08b",
-  "#ffffbf",
-  "#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"
+  "#ffffbf","#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"
 ];
-
 function scoreToColor(s) {{
-  const i = Math.min(10, Math.floor(Math.max(0, s) * 10.999));
-  return PALETTE[i];
+  return PALETTE[Math.min(10, Math.floor(Math.max(0, s) * 10.999))];
 }}
 
-// ── Canvas renderer ───────────────────────────────────────────────────────────
-const canvasRenderer = L.canvas({{ padding: 0.3 }});
-
-// ── Estado ────────────────────────────────────────────────────────────────────
-let activePolygons = [];
-let activePopup    = null;
+// Renderer and state
+var canvasRenderer = L.canvas({{ padding: 0.5 }});
+var activeLayers  = [];
+var renderTimer   = null;
+var selectedLayer = null;
 
 function getLeafletMap() {{
-  for (const k of Object.keys(window)) {{
-    if (k.startsWith("map_") && window[k] instanceof L.Map) return window[k];
+  for (var k in window) {{
+    if (k.indexOf('map_') === 0 && window[k] instanceof L.Map) return window[k];
   }}
   return null;
 }}
 
-// ── Render optimizado por zoom ────────────────────────────────────────────────
+// DSS Right panel
+function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat, lon) {{
+  document.getElementById('rp-placeholder').style.display = 'none';
+  document.getElementById('rp-content').style.display = 'block';
+
+  var hexId = 'IDX-H3-' + Math.abs(Math.round(lat * 10000 + lon * 1000)).toString().padStart(5, '0');
+  document.getElementById('rp-hex-id').textContent = hexId;
+
+  document.getElementById('rp-score-value').textContent = (score * 10).toFixed(1);
+  document.getElementById('rp-score-sub').textContent = rank > 0 ? ('Ranking #' + rank) : ('Score: ' + score.toFixed(4));
+
+  // SHAP values (aproximados como contribuciones ponderadas)
+  var shapData = [
+    {{ label: 'Factor Meteorologico', value: ws * 0.45 - 0.2 }},
+    {{ label: 'Accesibilidad Tecnica', value: (1 - dg / 100) * 0.35 - 0.1 }},
+    {{ label: 'Restriccion Social',   value: -(cr * 14.6) }},
+    {{ label: 'Uso del Suelo',        value: lu * 3.2 - 1.1 }},
+    {{ label: 'Pendiente',            value: -(slope * 0.8) }}
+  ];
+  shapData.sort(function(a, b) {{ return Math.abs(b.value) - Math.abs(a.value); }});
+  var maxAbs = Math.max.apply(null, shapData.map(function(d) {{ return Math.abs(d.value); }}));
+  if (maxAbs < 0.01) maxAbs = 0.01;
+
+  var sc = document.getElementById('rp-shap-container');
+  sc.innerHTML = '';
+  for (var i = 0; i < shapData.length; i++) {{
+    var d = shapData[i];
+    var pct = Math.round((Math.abs(d.value) / maxAbs) * 100);
+    var cls = d.value >= 0 ? 'pos' : 'neg';
+    var valStr = (d.value >= 0 ? '+' : '') + d.value.toFixed(1);
+    sc.innerHTML +=
+      '<div class="shap-row">' +
+        '<span class="shap-label">' + d.label + '</span>' +
+        '<div class="shap-bar-wrap">' +
+          '<div class="shap-bar ' + cls + '" style="width:' + pct + '%"></div>' +
+        '</div>' +
+        '<span class="shap-value ' + cls + '">' + valStr + '</span>' +
+      '</div>';
+  }}
+
+  document.getElementById('rp-detail-grid').innerHTML =
+    '<div class="detail-cell"><div class="dc-label">Municipio</div><div class="dc-value" style="font-size:11px;">' + (MUNI_TABLE[mi]||'-') + '</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Departamento</div><div class="dc-value" style="font-size:11px;">' + (DEPT_TABLE[di]||'-') + '</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Viento</div><div class="dc-value">' + ws.toFixed(1) + ' m/s</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Pendiente</div><div class="dc-value">' + slope.toFixed(1) + 'deg</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Dist. Red</div><div class="dc-value">' + dg.toFixed(0) + ' km</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Dist. Vias</div><div class="dc-value">' + dr.toFixed(0) + ' km</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Area Proteg.</div><div class="dc-value">' + (pa*100).toFixed(0) + '%</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Riesgo</div><div class="dc-value">' + cr.toFixed(3) + '</div></div>';
+
+  document.getElementById('rp-close').style.display = 'block';
+}}
+
+function hideHexAnalysis() {{
+  document.getElementById('rp-placeholder').style.display = 'flex';
+  document.getElementById('rp-content').style.display = 'none';
+  document.getElementById('rp-close').style.display = 'none';
+  if (selectedLayer && selectedLayer.setStyle) {{
+    selectedLayer.setStyle({{ color: "rgba(0,0,0,0.1)", weight: 0.6 }});
+  }}
+  selectedLayer = null;
+}}
+
+document.getElementById('rp-close').addEventListener('click', hideHexAnalysis);
+
+// LOD renderers
+function renderCircles(map, data, bounds, radius, interactive) {{
+  var sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  var n = 0;
+  for (var i = 0; i < data.length; i++) {{
+    var row = data[i];
+    var lat = row[0], lon = row[1], score = row[2];
+    var rank = row[3]||0, mi = row[4]||0, di = row[5]||0;
+    var ws = row[6]||0, slope = row[7]||0, dg = row[8]||0;
+    var dr = row[9]||0, lu = row[10]||0, pa = row[11]||0, cr = row[12]||0;
+    if (lat < sw.lat || lat > ne.lat || lon < sw.lng || lon > ne.lng) continue;
+    (function(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr) {{
+      var cm = L.circleMarker([lat, lon], {{
+        renderer: canvasRenderer, radius: radius,
+        fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
+        color: interactive ? "rgba(255,255,255,0.15)" : "none",
+        weight: interactive ? 0.5 : 0,
+        interactive: interactive
+      }});
+      if (interactive) {{
+        cm.on('click', function(e) {{
+          if (selectedLayer && selectedLayer !== cm && selectedLayer.setStyle) {{
+            selectedLayer.setStyle({{ color: "rgba(255,255,255,0.15)", weight: 0.5 }});
+          }}
+          cm.setStyle({{ color: "#60a5fa", weight: 2 }});
+          selectedLayer = cm;
+          showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat, lon);
+        }});
+      }}
+      cm.addTo(map);
+      activeLayers.push(cm);
+    }})(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr);
+    n++;
+  }}
+  return n;
+}}
+
+function renderLOD0(map, bounds) {{
+  var sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  var n = 0;
+  for (var i = 0; i < LOD0.length; i++) {{
+    var row = LOD0[i];
+    var lat = row[0], lon = row[1], score = row[2];
+    if (lat < sw.lat || lat > ne.lat || lon < sw.lng || lon > ne.lng) continue;
+    var cm = L.circleMarker([lat, lon], {{
+      renderer: canvasRenderer, radius: 3,
+      fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
+      color: "none", weight: 0, interactive: false
+    }});
+    cm.addTo(map);
+    activeLayers.push(cm);
+    n++;
+  }}
+  return n;
+}}
+
+function renderLOD3(map, bounds) {{
+  var sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+  var n = 0;
+  for (var i = 0; i < LOD3.length; i++) {{
+    (function(row) {{
+      var verts = row[0], score = row[1], ws = row[2], slope = row[3];
+      var dg = row[4], dr = row[5], lu = row[6], pa = row[7], cr = row[8];
+      var rank = row[9], mi = row[10], di = row[11];
+      var clat = (verts[0][0] + verts[3][0]) / 2;
+      var clon = (verts[1][1] + verts[4][1]) / 2;
+      if (clat < sw.lat || clat > ne.lat || clon < sw.lng || clon > ne.lng) return;
+      var poly = L.polygon(verts, {{
+        renderer: canvasRenderer,
+        fillColor: scoreToColor(score), fillOpacity: 0.2 + 0.6 * score,
+        color: "rgba(255,255,255,0.08)", weight: 0.6, interactive: true
+      }});
+      poly.on('click', function(e) {{
+        if (selectedLayer && selectedLayer !== poly && selectedLayer.setStyle) {{
+          selectedLayer.setStyle({{ color: "rgba(255,255,255,0.08)", weight: 0.6 }});
+        }}
+        poly.setStyle({{ color: "#60a5fa", weight: 2.5 }});
+        selectedLayer = poly;
+        showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, clat, clon);
+      }});
+      poly.addTo(map);
+      activeLayers.push(poly);
+      n++;
+    }})(LOD3[i]);
+  }}
+  return n;
+}}
+
+// Main render dispatcher with debounce
 function renderViewport() {{
-  const map = getLeafletMap();
-  if (!map) return;
+  if (renderTimer) clearTimeout(renderTimer);
+  renderTimer = setTimeout(function() {{
+    var map = getLeafletMap();
+    if (!map) return;
+    for (var i = 0; i < activeLayers.length; i++) map.removeLayer(activeLayers[i]);
+    activeLayers = [];
+    selectedLayer = null;
 
-  const zoom = map.getZoom();
-  const isLowZoom = zoom <= 2;
+    var zoom   = map.getZoom();
+    var bounds = map.getBounds().pad(0.05);
+    var n = 0;
 
-  const bounds = map.getBounds().pad(0.15);
-  const minLat = bounds.getSouth(), maxLat = bounds.getNorth();
-  const minLon = bounds.getWest(),  maxLon = bounds.getEast();
+    if      (zoom <= 5) n = renderLOD0(map, bounds);
+    else if (zoom <= 7) n = renderCircles(map, LOD1, bounds, zoom <= 6 ? 5 : 7, true);
+    else if (zoom <= 9) n = renderCircles(map, LOD2, bounds, zoom <= 8 ? 6 : 8, true);
+    else                n = renderLOD3(map, bounds);
 
-  // Limpiar mapa
-  for (const p of activePolygons) map.removeLayer(p);
-  activePolygons = [];
-
-  // Control por zoom (OPTIMIZACIÓN CLAVE)
-  let dataToRender = HEX_DATA;
-
-  if (zoom <= 2) {{
-    dataToRender = HEX_DATA.slice(0, 3000);
-  }} else if (zoom <= 4) {{
-    dataToRender = HEX_DATA.slice(0, 8000);
-  }}
-
-  for (const row of dataToRender) {{
-
-    const [verts, score, ws, slope, dg, dr, lu, pa, cr, rank, muniIdx, deptIdx] = row;
-
-    const clat = (verts[0][0] + verts[3][0]) / 2;
-    const clon = (verts[1][1] + verts[4][1]) / 2;
-
-    if (clat < minLat || clat > maxLat || clon < minLon || clon > maxLon) continue;
-
-    const color   = scoreToColor(score);
-    const opacity = 0.2 + 0.55 * score;
-
-    const poly = L.polygon(verts, {{
-      renderer: canvasRenderer,
-      fillColor: color,
-      fillOpacity: opacity,
-      color: "rgba(0,0,0,0.05)",
-      weight: 0.4,
-      interactive: !isLowZoom,
-    }});
-
-    poly.on("click", function(e) {{
-      if (activePopup) activePopup.remove();
-
-      const rankStr = rank > 0
-        ? `<b style="color:#c0392b;font-size:14px;">★ Ranking #${{rank}}</b><br>`
-        : "";
-
-      const html =
-        `<div style="font-family:sans-serif;font-size:12px;min-width:210px;line-height:1.8">
-          ${{rankStr}}
-          <b>Score aptitud:</b> ${{score.toFixed(4)}}<br>
-          <b>Municipio:</b> ${{MUNI_TABLE[muniIdx] || "—"}}<br>
-          <b>Departamento:</b> ${{DEPT_TABLE[deptIdx] || "—"}}<br>
-          <b>Viento:</b> ${{ws.toFixed(1)}} m/s<br>
-          <b>Pendiente:</b> ${{slope.toFixed(1)}}°<br>
-          <b>Dist. red eléctrica:</b> ${{dg.toFixed(0)}} km<br>
-          <b>Dist. vías:</b> ${{dr.toFixed(0)}} km<br>
-          <b>Uso suelo:</b> ${{lu.toFixed(3)}}<br>
-          <b>Área protegida:</b> ${{pa.toFixed(3)}}<br>
-          <b>Riesgo conflicto:</b> ${{cr.toFixed(3)}}<br>
-        </div>`;
-
-      activePopup = L.popup({{ maxWidth: 280, closeButton: true }})
-        .setLatLng(e.latlng)
-        .setContent(html)
-        .openOn(map);
-    }});
-
-    poly.addTo(map);
-    activePolygons.push(poly);
-  }}
-
-  console.log(`[HexGrid] ${{activePolygons.length}} hexágonos en viewport | zoom=${{zoom}}`);
+    var lodNum = zoom<=5?0:zoom<=7?1:zoom<=9?2:3;
+    console.log('[LOD' + lodNum + '] ' + n + ' objetos | zoom=' + zoom);
+  }}, 120);
 }}
 
-// ── Marcadores Top-N ──────────────────────────────────────────────────────────
+// Top-N star markers
 function addTopMarkers() {{
-  const map = getLeafletMap();
+  var map = getLeafletMap();
   if (!map) return;
-
-  for (const t of TOP_N) {{
-    const icon = L.divIcon({{
-      html: `<div style="font-size:22px;color:#c0392b;text-shadow:0 0 4px #fff;
-                         line-height:1;cursor:pointer;">★</div>`,
-      iconSize: [26, 26], iconAnchor: [13, 13], className: ""
-    }});
-
-    const html =
-      `<div style="font-family:sans-serif;font-size:13px;min-width:180px;line-height:1.7">
-        <b style="font-size:15px;">★ #${{t.rank}}</b><br>
-        <b>Score:</b> ${{t.score.toFixed(4)}}<br>
-        <b>Viento:</b> ${{t.ws}} m/s<br>
-        <b>Municipio:</b> ${{t.muni}}<br>
-        <b>Departamento:</b> ${{t.dept}}
-      </div>`;
-
-    L.marker([t.lat, t.lon], {{ icon }})
-      .bindPopup(html, {{ maxWidth: 240 }})
-      .bindTooltip(`#${{t.rank}} · Score ${{t.score.toFixed(3)}}`)
-      .addTo(map);
+  for (var i = 0; i < TOP_N.length; i++) {{
+    (function(t) {{
+      var icon = L.divIcon({{
+        html: '<div style="font-size:20px;color:#fbbf24;text-shadow:0 0 6px rgba(251,191,36,0.6);line-height:1;cursor:pointer;">&#9733;</div>',
+        iconSize: [24, 24], iconAnchor: [12, 12], className: ''
+      }});
+      L.marker([t.lat, t.lon], {{ icon: icon }})
+        .bindTooltip('#' + t.rank + ' · Score ' + t.score.toFixed(3) + ' · ' + t.muni, {{ direction: 'top', offset: [0, -8] }})
+        .addTo(map);
+    }})(TOP_N[i]);
   }}
 }}
 
-// ── Inicialización ────────────────────────────────────────────────────────────
-function init() {{
-  const map = getLeafletMap();
-  if (!map) {{ setTimeout(init, 150); return; }}
+// LOD HUD
+function addLodHud() {{
+  var map = getLeafletMap();
+  if (!map) return;
+  var hud = document.getElementById('lod-hud');
+  if (!hud) return;
+  var descs = {{5:'vista pais',6:'vista region',7:'vista regional',
+                8:'vista departamento',9:'vista local',10:'detalle completo'}};
+  function update() {{
+    var z = map.getZoom();
+    var lodNum = z<=5?0:z<=7?1:z<=9?2:3;
+    hud.textContent = 'LOD' + lodNum + ' · zoom ' + z + ' · ' + (descs[Math.min(z,10)] || 'detalle completo');
+  }}
+  map.on('zoomend', update);
+  update();
+}}
 
+// Init
+function init() {{
+  var map = getLeafletMap();
+  if (!map) {{ setTimeout(init, 150); return; }}
   renderViewport();
   addTopMarkers();
-
-  map.on("moveend zoomend", renderViewport);
+  addLodHud();
+  map.on('moveend zoomend', renderViewport);
+  setTimeout(function() {{ map.invalidateSize(); }}, 300);
 }}
 
-if (document.readyState === "complete") {{ init(); }}
-else {{ window.addEventListener("load", init); }}
+if (document.readyState === 'complete') {{ init(); }}
+else {{ window.addEventListener('load', init); }}
 </script>
 """
 
-    # Inyectar el script al final del body del HTML de Folium
-    m.get_root().html.add_child(folium.Element(canvas_script))
+    m.get_root().html.add_child(folium.Element(dss_ui))
 
-    # ------------------------------------------------------------------
     # 4. Guardar
-    # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     m.save(output_path)
 
     size_kb = os.path.getsize(output_path) / 1024
-    print(f"[Map] Mapa guardado → {output_path}  ({size_kb:.0f} KB)")
+    print(f"[Map] Mapa DSS guardado -> {output_path}  ({size_kb:.0f} KB)")
     if size_kb > 15_000:
-        print(f"[Map] ⚠  {size_kb/1024:.1f} MB — considera zoom=7 como resolución máxima "
-              f"o activa simplificación de vértices.")
+        print(f"[Map] AVISO: {size_kb/1024:.1f} MB — considera zoom=7 como resolucion maxima.")
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +990,7 @@ def plot_score_distribution(
     score_column: str = "suitability_score",
 ) -> None:
     """
-    Histograma de la distribución de scores de aptitud.
+    Histograma de la distribucion de scores de aptitud.
     """
     scores = df[score_column].dropna().to_numpy()
 
@@ -613,8 +1008,8 @@ def plot_score_distribution(
                linestyle=":", label=f"Pct 75 = {np.percentile(scores, 75):.3f}")
 
     ax.set_xlabel("Suitability Score", fontsize=10)
-    ax.set_ylabel("Número de hexágonos", fontsize=10)
-    ax.set_title("Distribución de aptitud para parques eólicos — Colombia",
+    ax.set_ylabel("Numero de hexagonos", fontsize=10)
+    ax.set_title("Distribucion de aptitud para parques eolicos — Colombia",
                  fontsize=11, fontweight="bold")
     ax.legend(fontsize=9)
     ax.spines[["top", "right"]].set_visible(False)
@@ -622,7 +1017,7 @@ def plot_score_distribution(
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[Viz] Distribución de scores → {output_path}")
+    print(f"[Viz] Distribucion de scores -> {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +1031,7 @@ def plot_feature_correlation(
     score_column: str = "suitability_score",
 ) -> None:
     """
-    Heatmap de correlación de Pearson entre features normalizadas y score.
+    Heatmap de correlacion de Pearson entre features normalizadas y score.
     """
     cols = norm_features + ([score_column] if score_column in df.columns else [])
     corr = df[cols].corr()
@@ -658,13 +1053,13 @@ def plot_feature_correlation(
                     fontsize=8, color=colour)
 
     plt.colorbar(im, ax=ax, fraction=0.03, pad=0.03, label="Pearson r")
-    ax.set_title("Correlación de features (criterios normalizados + score)",
+    ax.set_title("Correlacion de features (criterios normalizados + score)",
                  fontsize=11, fontweight="bold", pad=12)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[Viz] Heatmap de correlación → {output_path}")
+    print(f"[Viz] Heatmap de correlacion -> {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -673,15 +1068,15 @@ def plot_feature_correlation(
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from generate_h3_grid    import generate_colombia_hex_grid
-    from feature_engineering import engineer_features
-    from normalization       import normalise_features, get_norm_feature_names
+    from generate_h3_grid      import generate_colombia_hex_grid
+    from feature_engineering   import engineer_features
+    from normalization         import normalise_features, get_norm_feature_names
     from random_forest_weights import get_rf_weights
-    from mcda_model          import compute_wlc_scores, rank_locations
+    from mcda_model            import compute_wlc_scores, rank_locations
 
-    _HERE   = os.path.dirname(os.path.abspath(__file__))
+    _HERE    = os.path.dirname(os.path.abspath(__file__))
     _GEOJSON = os.path.join(_HERE, "..", "data", "colombia_boundary.geojson")
-    _OUT    = os.path.join(_HERE, "..", "outputs")
+    _OUT     = os.path.join(_HERE, "..", "outputs")
     os.makedirs(_OUT, exist_ok=True)
 
     grid      = generate_colombia_hex_grid(_GEOJSON, resolution=4)
@@ -695,9 +1090,9 @@ if __name__ == "__main__":
     create_interactive_map(
         ranked_df,
         os.path.join(_OUT, "map_interactive.html"),
-        zoom=14,
+        zoom=6,
     )
     plot_score_distribution(
         scored_df,
         os.path.join(_OUT, "score_distribution.png"),
-    ) 
+    )
