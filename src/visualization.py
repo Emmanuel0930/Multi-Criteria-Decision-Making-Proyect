@@ -10,7 +10,6 @@ Combina dos mejoras complementarias:
 1. **Multi-LOD rendering** (del optimizado):
    - LOD0 zoom<=5 : ~2 000 puntos simples, submuestreo 0.5°
    - LOD1 zoom 6-7: ~5 000 circleMarkers, submuestreo 0.15°
-   - LOD2 zoom 8-9: ~15 000 circleMarkers, submuestreo 0.05°
    - LOD3 zoom>=10: polígonos H3 reales, viewport-culled
    - Debounce de 120 ms en renderViewport para evitar re-renders en cadena
    - HUD de zoom/nivel en el mapa
@@ -213,7 +212,6 @@ def _build_lod_payload(
 
     LOD0 zoom<=5  : puntos [lat,lon,score]              submuestreo 0.5 deg  ~2k
     LOD1 zoom 6-7 : circulos [lat,lon,score,rank,...]   submuestreo 0.15 deg ~5k
-    LOD2 zoom 8-9 : circulos [lat,lon,score,rank,...]   submuestreo 0.05 deg ~15k
     LOD3 zoom>=10 : poligonos reales [verts,score,...]  viewport-culled en JS
 
     El submuestreo es espacial (mejor score por celda), no aleatorio,
@@ -257,14 +255,6 @@ def _build_lod_payload(
         lod1.append([round(float(r["lat"]), 3), round(float(r["lon"]), 3),
                      sc, rk, mi, di, ws, sl, dg, dr, lu, pa, cr])
 
-    # LOD2: circulos 0.05 deg
-    s2 = _spatial_sample(df, score_column, 0.05)
-    lod2 = []
-    for _, r in s2.iterrows():
-        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
-        lod2.append([round(float(r["lat"]), 3), round(float(r["lon"]), 3),
-                     sc, rk, mi, di, ws, sl, dg, dr, lu, pa, cr])
-
     # LOD3: poligonos reales (viewport-culled en JS)
     lod3 = []
     for _, r in df.iterrows():
@@ -283,12 +273,10 @@ def _build_lod_payload(
         lod3.append([verts, sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di])
 
     sep = (",", ":")
-    print(f"[Map] LOD sizes -> LOD0:{len(lod0):,}  LOD1:{len(lod1):,}  "
-          f"LOD2:{len(lod2):,}  LOD3:{len(lod3):,}")
+    print(f"[Map] LOD sizes -> LOD0:{len(lod0):,}  LOD1:{len(lod1):,}  LOD3:{len(lod3):,}")
     return (
         json.dumps(lod0, separators=sep),
         json.dumps(lod1, separators=sep),
-        json.dumps(lod2, separators=sep),
         json.dumps(lod3, separators=sep),
         json.dumps(munis, separators=sep),
         json.dumps(depts, separators=sep),
@@ -349,7 +337,7 @@ def create_interactive_map(
     print(f"[Map] Construyendo mapa DSS multi-LOD | {n:,} hexagonos | zoom={zoom}")
 
     # 1. Serializar los 4 niveles de detalle
-    lod0_js, lod1_js, lod2_js, lod3_js, muni_table_js, dept_table_js = \
+    lod0_js, lod1_js, lod3_js, muni_table_js, dept_table_js = \
         _build_lod_payload(df, score_column)
     top_js = _build_top_n_js(df, score_column, top_n_highlight)
 
@@ -796,11 +784,9 @@ def create_interactive_map(
 // Data from Python
 // LOD0 [lat,lon,score]              zoom<=5  submuestreo 0.5 deg  ~2k puntos
 // LOD1 [lat,lon,score,rank,mi,di,…] zoom 6-7 submuestreo 0.15 deg ~5k circulos
-// LOD2 [lat,lon,score,rank,mi,di,…] zoom 8-9 submuestreo 0.05 deg ~15k circulos
 // LOD3 [verts,score,…]              zoom>=10 poligonos reales viewport-culled
 var LOD0       = {lod0_js};
 var LOD1       = {lod1_js};
-var LOD2       = {lod2_js};
 var LOD3       = {lod3_js};
 var MUNI_TABLE = {muni_table_js};
 var DEPT_TABLE = {dept_table_js};
@@ -1196,7 +1182,6 @@ function renderViewport() {{
 
     if      (zoom <= 5) n = renderLOD0(map, bounds);
     else if (zoom <= 7) n = renderCircles(map, LOD1, bounds, zoom <= 6 ? 5 : 7, true);
-    else if (zoom <= 9) n = renderCircles(map, LOD2, bounds, zoom <= 8 ? 6 : 8, true);
     else                n = renderLOD3(map, bounds);
 
     var lodNum = zoom<=5?0:zoom<=7?1:zoom<=9?2:3;
