@@ -15,7 +15,7 @@ Combina dos mejoras complementarias:
    - HUD de zoom/nivel en el mapa
    - _spatial_sample(): selecciona el hexágono de mayor score por celda
 
-2. **UI Prototipo DSS** (del nuevo):
+2. **UI Prototipo ** (del nuevo):
    - Topbar oscuro: logo, versión, subtítulo EAFIT
    - Panel izquierdo: ponderación de criterios por categorías A/B/C
    - Panel derecho: análisis del hexágono seleccionado con:
@@ -221,8 +221,10 @@ def _build_lod_payload(
 
     munis = list(df.get("municipality", pd.Series(["—"] * len(df))).fillna("—").unique())
     depts = list(df.get("department",   pd.Series(["—"] * len(df))).fillna("—").unique())
+    divis = list(df.get("divipola_code", pd.Series(["—"] * len(df))).fillna("—").astype(str).unique())
     muni_idx_map = {m: i for i, m in enumerate(munis)}
     dept_idx_map = {d: i for i, d in enumerate(depts)}
+    divi_idx_map = {d: i for i, d in enumerate(divis)}
 
     has_vertices = "vertices" in df.columns
 
@@ -237,28 +239,30 @@ def _build_lod_payload(
         rank_val = int(r["rank"]) if "rank" in r.index and not pd.isna(r.get("rank")) else 0
         muni_str = str(r.get("municipality", "—")) if "municipality" in r.index else "—"
         dept_str = str(r.get("department",   "—")) if "department"   in r.index else "—"
+        divi_str = str(r.get("divipola_code", "—")) if "divipola_code" in r.index else "—"
         return (_f(score_column), _f("wind_speed"), _f("slope"),
                 _f("dist_to_grid"), _f("dist_to_roads"), _f("land_use"),
                 _f("protected_area"), _f("conflict_risk"),
-                rank_val, muni_idx_map.get(muni_str, 0), dept_idx_map.get(dept_str, 0))
+          rank_val, muni_idx_map.get(muni_str, 0), dept_idx_map.get(dept_str, 0),
+          divi_idx_map.get(divi_str, 0))
 
     # LOD0: puntos [lat, lon, score] submuestreados 0.5 deg
     s0 = _spatial_sample(df, score_column, 0.5)
     lod0 = [[round(float(r["lat"]), 3), round(float(r["lon"]), 3),
              round(float(r[score_column]), 3)] for _, r in s0.iterrows()]
 
-    # LOD1: circulos 0.15 deg [lat,lon,score,rank,mi,di,ws,sl,dg,dr,lu,pa,cr]
+    # LOD1: circulos 0.15 deg [lat,lon,score,rank,mi,di,dpi,ws,sl,dg,dr,lu,pa,cr]
     s1 = _spatial_sample(df, score_column, 0.15)
     lod1 = []
     for _, r in s1.iterrows():
-        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
+        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di, dpi = _meta(r)
         lod1.append([round(float(r["lat"]), 3), round(float(r["lon"]), 3),
-                     sc, rk, mi, di, ws, sl, dg, dr, lu, pa, cr])
+             sc, rk, mi, di, dpi, ws, sl, dg, dr, lu, pa, cr])
 
     # LOD3: poligonos reales (viewport-culled en JS)
     lod3 = []
     for _, r in df.iterrows():
-        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di = _meta(r)
+        sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di, dpi = _meta(r)
         if has_vertices and r["vertices"] is not None:
             raw  = r["vertices"]
             ring = raw[:-1] if len(raw) == 7 and raw[0] == raw[-1] else raw[:6]
@@ -270,7 +274,7 @@ def _build_lod_payload(
             verts = [[round(lat_c + r_deg * math.sin(math.radians(60 * k + 30)), 4),
                       round(lon_c + rx    * math.cos(math.radians(60 * k + 30)), 4)]
                      for k in range(6)]
-        lod3.append([verts, sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di])
+        lod3.append([verts, sc, ws, sl, dg, dr, lu, pa, cr, rk, mi, di, dpi])
 
     sep = (",", ":")
     print(f"[Map] LOD sizes -> LOD0:{len(lod0):,}  LOD1:{len(lod1):,}  LOD3:{len(lod3):,}")
@@ -280,6 +284,7 @@ def _build_lod_payload(
         json.dumps(lod3, separators=sep),
         json.dumps(munis, separators=sep),
         json.dumps(depts, separators=sep),
+        json.dumps(divis, separators=sep),
     )
 
 
@@ -301,7 +306,7 @@ def _build_top_n_js(df: pd.DataFrame, score_column: str, top_n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Mapa interactivo — LOD + UI Prototipo DSS
+# Mapa interactivo — LOD + UI Prototipo 
 # ---------------------------------------------------------------------------
 
 def create_interactive_map(
@@ -316,7 +321,7 @@ def create_interactive_map(
     """
     Genera un mapa HTML interactivo con:
       - Multi-LOD rendering (4 niveles de detalle segun zoom)
-      - UI Prototipo DSS: topbar, panel de criterios, panel de analisis multicriterio
+      - UI Prototipo: topbar, panel de criterios, panel de analisis multicriterio
 
     Parameters
     ----------
@@ -334,10 +339,10 @@ def create_interactive_map(
         raise ImportError("Instala Folium:  pip install folium")
 
     n = len(df)
-    print(f"[Map] Construyendo mapa DSS multi-LOD | {n:,} hexagonos | zoom={zoom}")
+    print(f"[Map] Construyendo mapa multi-LOD | {n:,} hexagonos | zoom={zoom}")
 
     # 1. Serializar los 4 niveles de detalle
-    lod0_js, lod1_js, lod3_js, muni_table_js, dept_table_js = \
+    lod0_js, lod1_js, lod3_js, muni_table_js, dept_table_js, divi_table_js = \
         _build_lod_payload(df, score_column)
     top_js = _build_top_n_js(df, score_column, top_n_highlight)
 
@@ -355,7 +360,7 @@ def create_interactive_map(
     Fullscreen(position="topright").add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
-    # 3. UI Prototipo DSS + motor LOD
+    # 3. UI Prototipo + motor LOD
     dss_ui = f"""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -602,14 +607,12 @@ def create_interactive_map(
 
   <div id="dss-topbar">
     <div class="logo">
-      <div class="icon">&#x229E;</div>
-      Prototipo <span class="accent">&nbsp;DSS</span>
+      <div class="icon">🗺️</div>
+      Prototipo <span class="accent">&nbsp;MCDM</span>
     </div>
     <div class="separator"></div>
-    <div class="subtitle">EAFIT Intelligence System</div>
     <div class="spacer"></div>
-    <div class="version">VERSION: 2.0.4 - INVESTIGACION</div>
-    <button class="share-btn" title="Compartir">&#x21E7;</button>
+    <div class="version">Proyecto de investigación</div>
   </div>
 
   <div id="dss-body">
@@ -662,10 +665,10 @@ def create_interactive_map(
     <div id="dss-map-area">
       <div id="lod-hud">zoom 6 - vista region</div>
       <div id="dss-legend">
-        <div class="leg-title">Suitability Score</div>
+        <div class="leg-title">Puntuación de idoneidad</div>
         <div class="leg-bar" id="leg-gradient"></div>
         <div class="leg-labels">
-          <span>0.0</span><span>0.2</span><span>0.4</span><span>0.6</span><span>0.8</span><span>1.0</span>
+          <span>0</span><span>2</span><span>4</span><span>6</span><span>8</span><span>10</span>
         </div>
         <div class="leg-note">* Top-{top_n_highlight} candidatos</div>
       </div>
@@ -687,21 +690,10 @@ def create_interactive_map(
         <button id="rp-close">x</button>
 
         <div id="rp-score-card">
-          <div class="sc-label">Indice Global</div>
+          <div class="sc-label">Puntuación</div>
           <div class="sc-value" id="rp-score-value">-</div>
           <div class="sc-sub" id="rp-score-sub">-</div>
         </div>
-
-        <div class="shap-section-header">
-          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-            <rect x="3" y="3" width="7" height="7"/>
-            <rect x="14" y="3" width="7" height="7"/>
-            <rect x="14" y="14" width="7" height="7"/>
-            <rect x="3" y="14" width="7" height="7"/>
-          </svg>
-          Explicabilidad (SHAP Values)
-        </div>
-        <div id="rp-shap-container"></div>
 
         <hr class="rp-divider">
         <div class="detail-grid" id="rp-detail-grid"></div>
@@ -714,6 +706,7 @@ def create_interactive_map(
           <input id="grp-name" class="cmp-input" type="text" placeholder="Nombre del grupo (ej: Norte Viento Alto)">
           <div class="cmp-row">
             <button id="grp-create" class="cmp-btn primary">Crear grupo</button>
+            <button id="grp-leave" class="cmp-btn">Dejar grupo</button>
           </div>
 
           <select id="grp-active" class="cmp-select"></select>
@@ -790,6 +783,7 @@ var LOD1       = {lod1_js};
 var LOD3       = {lod3_js};
 var MUNI_TABLE = {muni_table_js};
 var DEPT_TABLE = {dept_table_js};
+var DIVI_TABLE = {divi_table_js};
 var TOP_N      = {top_js};
 
 // Color palette RdYlGn
@@ -843,18 +837,17 @@ function findGroupForHex(hexId) {{
 function renderGroupSelector() {{
   var sel = document.getElementById('grp-active');
   if (!sel) return;
-  var html = '';
+  var html = '<option value=""' + (!activeGroup ? ' selected' : '') + '> </option>';
   if (!groupOrder.length) {{
-    html = '<option value="">Sin grupos</option>';
-    activeGroup = '';
+    html = '<option value="" selected> </option>';
   }} else {{
     for (var i = 0; i < groupOrder.length; i++) {{
       var g = groupOrder[i];
       var selected = (g === activeGroup) ? ' selected' : '';
       html += '<option value="' + g + '"' + selected + '>' + g + ' (' + groups[g].items.length + ')</option>';
     }}
-    if (!activeGroup || !groups[activeGroup]) activeGroup = groupOrder[0];
   }}
+  if (activeGroup && !groups[activeGroup]) activeGroup = '';
   sel.innerHTML = html;
   sel.value = activeGroup;
 }}
@@ -931,6 +924,12 @@ function createGroup() {{
   renderViewport();
 }}
 
+function leaveActiveGroup() {{
+  activeGroup = '';
+  renderGroupSelector();
+  renderViewport();
+}}
+
 function addCurrentToActiveGroup() {{
   if (!currentHex || !activeGroup || !groups[activeGroup]) return;
   var items = groups[activeGroup].items;
@@ -967,7 +966,7 @@ function deleteActiveGroup() {{
 }}
 
 // DSS Right panel
-function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat, lon) {{
+function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, lat, lon) {{
   document.getElementById('rp-placeholder').style.display = 'none';
   document.getElementById('rp-content').style.display = 'block';
 
@@ -977,6 +976,7 @@ function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat
     score: score,
     muni: (MUNI_TABLE[mi] || '-'),
     dept: (DEPT_TABLE[di] || '-'),
+    divi: (DIVI_TABLE[dpi] || '-'),
     rank: rank,
     lat: lat,
     lon: lon
@@ -984,40 +984,12 @@ function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat
   document.getElementById('rp-hex-id').textContent = hexId;
 
   document.getElementById('rp-score-value').textContent = (score * 10).toFixed(1);
-  document.getElementById('rp-score-sub').textContent = rank > 0 ? ('Ranking #' + rank) : ('Score: ' + score.toFixed(4));
-
-  // SHAP values (aproximados como contribuciones ponderadas)
-  var shapData = [
-    {{ label: 'Factor Meteorologico', value: ws * 0.45 - 0.2 }},
-    {{ label: 'Accesibilidad Tecnica', value: (1 - dg / 100) * 0.35 - 0.1 }},
-    {{ label: 'Restriccion Social',   value: -(cr * 14.6) }},
-    {{ label: 'Uso del Suelo',        value: lu * 3.2 - 1.1 }},
-    {{ label: 'Pendiente',            value: -(slope * 0.8) }}
-  ];
-  shapData.sort(function(a, b) {{ return Math.abs(b.value) - Math.abs(a.value); }});
-  var maxAbs = Math.max.apply(null, shapData.map(function(d) {{ return Math.abs(d.value); }}));
-  if (maxAbs < 0.01) maxAbs = 0.01;
-
-  var sc = document.getElementById('rp-shap-container');
-  sc.innerHTML = '';
-  for (var i = 0; i < shapData.length; i++) {{
-    var d = shapData[i];
-    var pct = Math.round((Math.abs(d.value) / maxAbs) * 100);
-    var cls = d.value >= 0 ? 'pos' : 'neg';
-    var valStr = (d.value >= 0 ? '+' : '') + d.value.toFixed(1);
-    sc.innerHTML +=
-      '<div class="shap-row">' +
-        '<span class="shap-label">' + d.label + '</span>' +
-        '<div class="shap-bar-wrap">' +
-          '<div class="shap-bar ' + cls + '" style="width:' + pct + '%"></div>' +
-        '</div>' +
-        '<span class="shap-value ' + cls + '">' + valStr + '</span>' +
-      '</div>';
-  }}
+  document.getElementById('rp-score-sub').textContent = rank > 0 ? ('Ranking #' + rank) : ('Escala del 0(no idoneo) al 10(idoneo)');
 
   document.getElementById('rp-detail-grid').innerHTML =
     '<div class="detail-cell"><div class="dc-label">Municipio</div><div class="dc-value" style="font-size:11px;">' + (MUNI_TABLE[mi]||'-') + '</div></div>' +
     '<div class="detail-cell"><div class="dc-label">Departamento</div><div class="dc-value" style="font-size:11px;">' + (DEPT_TABLE[di]||'-') + '</div></div>' +
+    '<div class="detail-cell"><div class="dc-label">Divipola</div><div class="dc-value" style="font-size:11px;">' + (DIVI_TABLE[dpi]||'-') + '</div></div>' +
     '<div class="detail-cell"><div class="dc-label">Viento</div><div class="dc-value">' + ws.toFixed(1) + ' m/s</div></div>' +
     '<div class="detail-cell"><div class="dc-label">Pendiente</div><div class="dc-value">' + slope.toFixed(1) + 'deg</div></div>' +
     '<div class="detail-cell"><div class="dc-label">Dist. Red</div><div class="dc-value">' + dg.toFixed(0) + ' km</div></div>' +
@@ -1046,6 +1018,7 @@ function hideHexAnalysis() {{
 
 document.getElementById('rp-close').addEventListener('click', hideHexAnalysis);
 document.getElementById('grp-create').addEventListener('click', createGroup);
+document.getElementById('grp-leave').addEventListener('click', leaveActiveGroup);
 document.getElementById('grp-add-current').addEventListener('click', addCurrentToActiveGroup);
 document.getElementById('grp-remove-current').addEventListener('click', removeCurrentFromActiveGroup);
 document.getElementById('grp-clear').addEventListener('click', clearActiveGroup);
@@ -1065,14 +1038,14 @@ function renderCircles(map, data, bounds, radius, interactive) {{
   for (var i = 0; i < data.length; i++) {{
     var row = data[i];
     var lat = row[0], lon = row[1], score = row[2];
-    var rank = row[3]||0, mi = row[4]||0, di = row[5]||0;
-    var ws = row[6]||0, slope = row[7]||0, dg = row[8]||0;
-    var dr = row[9]||0, lu = row[10]||0, pa = row[11]||0, cr = row[12]||0;
+    var rank = row[3]||0, mi = row[4]||0, di = row[5]||0, dpi = row[6]||0;
+    var ws = row[7]||0, slope = row[8]||0, dg = row[9]||0;
+    var dr = row[10]||0, lu = row[11]||0, pa = row[12]||0, cr = row[13]||0;
     var hexId = buildHexId(lat, lon);
     var groupName = findGroupForHex(hexId);
     var groupColor = groupName ? getGroupColor(groupName) : null;
     if (lat < sw.lat || lat > ne.lat || lon < sw.lng || lon > ne.lng) continue;
-    (function(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr, groupColor) {{
+    (function(lat, lon, score, rank, mi, di, dpi, ws, slope, dg, dr, lu, pa, cr, groupColor) {{
       var baseColor = groupColor || (interactive ? "rgba(255,255,255,0.15)" : "none");
       var baseWeight = groupColor ? 1.8 : (interactive ? 0.5 : 0);
       var cm = L.circleMarker([lat, lon], {{
@@ -1094,12 +1067,12 @@ function renderCircles(map, data, bounds, radius, interactive) {{
           }}
           cm.setStyle({{ color: "#60a5fa", weight: 2 }});
           selectedLayer = cm;
-          showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, lat, lon);
+          showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, lat, lon);
         }});
       }}
       cm.addTo(map);
       activeLayers.push(cm);
-    }})(lat, lon, score, rank, mi, di, ws, slope, dg, dr, lu, pa, cr, groupColor);
+    }})(lat, lon, score, rank, mi, di, dpi, ws, slope, dg, dr, lu, pa, cr, groupColor);
     n++;
   }}
   return n;
@@ -1131,7 +1104,7 @@ function renderLOD3(map, bounds) {{
     (function(row) {{
       var verts = row[0], score = row[1], ws = row[2], slope = row[3];
       var dg = row[4], dr = row[5], lu = row[6], pa = row[7], cr = row[8];
-      var rank = row[9], mi = row[10], di = row[11];
+      var rank = row[9], mi = row[10], di = row[11], dpi = row[12];
       var clat = (verts[0][0] + verts[3][0]) / 2;
       var clon = (verts[1][1] + verts[4][1]) / 2;
       var hexId = buildHexId(clat, clon);
@@ -1156,7 +1129,7 @@ function renderLOD3(map, bounds) {{
         }}
         poly.setStyle({{ color: "#60a5fa", weight: 2.5 }});
         selectedLayer = poly;
-        showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, clat, clon);
+        showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, clat, clon);
       }});
       poly.addTo(map);
       activeLayers.push(poly);
@@ -1216,7 +1189,7 @@ function addLodHud() {{
                 8:'vista departamento',9:'vista local',10:'detalle completo'}};
   function update() {{
     var z = map.getZoom();
-    var lodNum = z<=5?0:z<=7?1:z<=9?2:3;
+    var lodNum = z<=5?0:z<=7?1:3;
     hud.textContent = 'LOD' + lodNum + ' · zoom ' + z + ' · ' + (descs[Math.min(z,10)] || 'detalle completo');
   }}
   map.on('zoomend', update);
@@ -1247,7 +1220,7 @@ else {{ window.addEventListener('load', init); }}
     m.save(output_path)
 
     size_kb = os.path.getsize(output_path) / 1024
-    print(f"[Map] Mapa DSS guardado -> {output_path}  ({size_kb:.0f} KB)")
+    print(f"[Map] Mapa guardado -> {output_path}  ({size_kb:.0f} KB)")
     if size_kb > 15_000:
         print(f"[Map] AVISO: {size_kb/1024:.1f} MB — considera zoom=7 como resolucion maxima.")
 
