@@ -9,7 +9,7 @@ This script orchestrates the full MCDA workflow in sequential steps:
     Step 2 – Engineer spatial features for each hexagon
     Step 3 – Normalise all criteria to a [0, 1] suitability scale
     Step 4 – Train Random Forest classifier and extract criterion weights
-    Step 5 – Apply Weighted Linear Combination MCDA model
+    Step 5 – Apply Weighted Linear Combination, AHP, or BWM-PROMETHEE MCDA model
     Step 6 – Rank candidate locations
     Step 7 – Compute SHAP-like explanations
     Step 8 – Run sensitivity analysis
@@ -63,6 +63,8 @@ from random_forest_weights import get_rf_weights
 from mcda_model           import compute_wlc_scores, rank_locations, summarise_top_locations
 from ahp_model            import (build_pairwise_matrix, compute_ahp_weights,
                                     compute_ahp_scores, print_ahp_report)
+from bwm_promethee        import compute_bwm_weights, compute_promethee_scores
+from cache_manager        import get_or_run
 from visualization        import (create_interactive_map,
                                    plot_score_distribution, plot_feature_correlation)
 
@@ -70,7 +72,7 @@ from visualization        import (create_interactive_map,
 # CONFIGURACIÓN GENERAL
 # ===========================================================================
 DEFAULT_CONFIG: Dict[str, Any] = {
-    # Algoritmo MCDA: "wlc" o "ahp"
+    # Algoritmo MCDA: "wlc", "ahp" o "bwm"
     "algorithm":      "ahp",
 
     # Grid
@@ -96,6 +98,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "geojson_path":  os.path.join(_DATA_DIR, "colombia_boundary.geojson"),
     "municipios_path": os.path.join(_DATA_DIR, "DIVIPOLA_CentrosPoblados.csv"),
     "output_dir":    _OUT_DIR,
+
+    # Cache
+    "force_rerun":   False,
 }
 
 
@@ -165,6 +170,43 @@ AHP_COMPARISONS: Dict[Tuple[str, str], float] = {
 
 
 # ===========================================================================
+# CONFIGURACIÓN BWM + PROMETHEE II
+# ===========================================================================
+# Usa los mismos criterios normalizados que AHP, pero calcula los pesos con
+# Best Worst Method y el ranking final con PROMETHEE II.
+
+BWM_BEST_TO_OTHERS: Dict[str, float] = {
+    "wind_speed_norm":     1,
+    "slope_norm":         5,
+    "dist_to_grid_norm":  3,
+    "dist_to_roads_norm": 4,
+    "land_use_norm":      4,
+    "protected_area_norm": 7,
+    "conflict_risk_norm": 6,
+}
+
+BWM_OTHERS_TO_WORST: Dict[str, float] = {
+    "wind_speed_norm":     7,
+    "slope_norm":         5,
+    "dist_to_grid_norm":  4,
+    "dist_to_roads_norm": 4,
+    "land_use_norm":      4,
+    "protected_area_norm": 3,
+    "conflict_risk_norm": 1,
+}
+
+BWM_PREFERENCE_FUNCTIONS: Dict[str, str] = {
+    "wind_speed_norm":     "usual",
+    "slope_norm":         "usual",
+    "dist_to_grid_norm":  "usual",
+    "dist_to_roads_norm": "usual",
+    "land_use_norm":      "usual",
+    "protected_area_norm": "usual",
+    "conflict_risk_norm":  "usual",
+}
+
+
+# ===========================================================================
 # PASOS DEL PIPELINE
 # ===========================================================================
 
@@ -172,6 +214,16 @@ def _banner(title: str) -> None:
     print("\n" + "=" * 70)
     print(f"  {title}")
     print("=" * 70)
+
+
+def _to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Convierte DataFrame a lista de registros JSON-serializable."""
+    return df.to_dict(orient="records")
+
+
+def _from_records(records: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Reconstruye DataFrame desde registros de caché."""
+    return pd.DataFrame.from_records(records)
 
 
 def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -188,109 +240,184 @@ def run_pipeline(config: Dict[str, Any]) -> Dict[str, Any]:
 
     print(f"\n  Algoritmo seleccionado: {algorithm.upper()}")
 
-    # ------------------------------------------------------------------
-    # Paso 1 – Grilla H3
-    # ------------------------------------------------------------------
-    _banner("PASO 1 – Generando grilla hexagonal H3")
-    load_boundary(config["geojson_path"])
-    hex_grid = generate_colombia_hex_grid(
-        config["geojson_path"],
-        resolution=config["resolution"],
-        municipios_path=config["municipios_path"],
-
-    )
-
-    # ------------------------------------------------------------------
-    # Paso 2 – Features espaciales
-    # ------------------------------------------------------------------
-    _banner("PASO 2 – Ingeniería de características espaciales")
-    features_df = engineer_features(hex_grid, seed=config["feature_seed"])
-    raw_cols = list(FEATURE_DIRECTION.keys())
-    validate_feature_dataframe(features_df, ["hex_id", "lon", "lat"] + raw_cols)
-
-    # ------------------------------------------------------------------
-    # Paso 3 – Normalización
-    # ------------------------------------------------------------------
-    _banner("PASO 3 – Normalizando criterios a escala [0, 1]")
-    norm_df = normalise_features(features_df, method=config["norm_method"])
-    norm_cols = get_norm_feature_names()
-
-    # ------------------------------------------------------------------
-    # Paso 4 – Pesos según algoritmo
-    # ------------------------------------------------------------------
     model  = None
     labels = None
+    norm_cols = get_norm_feature_names()
 
-    if algorithm == "wlc":
-        _banner("PASO 4 – WLC: entrenando Random Forest para derivar pesos")
-        model, weights, labels = get_rf_weights(
-            norm_df,
-            norm_cols,
-            suitability_threshold=config["label_threshold"],
-            n_estimators=config["rf_n_estimators"],
-            seed=config["rf_seed"],
-        )
-        print("\n[WLC] Pesos derivados del Random Forest (MDI):")
-        for col, w in sorted(weights.items(), key=lambda x: -x[1]):
-            print(f"  {col:30s}  {w:.4f}  {'█' * int(w * 40)}")
-
-    elif algorithm == "ahp":
-        _banner("PASO 4 – AHP: calculando pesos desde matriz de comparación")
-
-        # Construir la matriz y calcular pesos
-        pairwise_matrix = build_pairwise_matrix(AHP_CRITERIA, AHP_COMPARISONS)
-        weights, lambda_max, cr, is_consistent = compute_ahp_weights(
-            pairwise_matrix, AHP_CRITERIA
+    def _run_model(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        # ------------------------------------------------------------------
+        # Paso 1 – Grilla H3
+        # ------------------------------------------------------------------
+        _banner("PASO 1 – Generando grilla hexagonal H3")
+        load_boundary(cfg["geojson_path"])
+        hex_grid_local = generate_colombia_hex_grid(
+            cfg["geojson_path"],
+            resolution=cfg["resolution"],
+            municipios_path=cfg["municipios_path"],
         )
 
-        # Reporte detallado
-        print_ahp_report(weights, lambda_max, cr, is_consistent,
-                         pairwise_matrix, AHP_CRITERIA)
+        # ------------------------------------------------------------------
+        # Paso 2 – Features espaciales
+        # ------------------------------------------------------------------
+        _banner("PASO 2 – Ingeniería de características espaciales")
+        features_df_local = engineer_features(hex_grid_local, seed=cfg["feature_seed"])
+        raw_cols = list(FEATURE_DIRECTION.keys())
+        validate_feature_dataframe(features_df_local, ["hex_id", "lon", "lat"] + raw_cols)
 
-        if not is_consistent:
-            print("\n  ⚠  CR >= 0.10 — los juicios son inconsistentes.")
-            print("     Revisa AHP_COMPARISONS en main.py y ajusta los valores.")
-            print("     El pipeline continúa pero los pesos pueden no ser fiables.")
+        # ------------------------------------------------------------------
+        # Paso 3 – Normalización
+        # ------------------------------------------------------------------
+        _banner("PASO 3 – Normalizando criterios a escala [0, 1]")
+        norm_df_local = normalise_features(features_df_local, method=cfg["norm_method"])
 
-        # Asegurarse de que todos los norm_cols tienen peso (0 si no están en AHP_CRITERIA)
-        for col in norm_cols:
-            if col not in weights:
-                weights[col] = 0.0
+        # ------------------------------------------------------------------
+        # Paso 4 – Pesos según algoritmo
+        # ------------------------------------------------------------------
+        labels_local = None
 
-    else:
-        raise ValueError(
-            f"Algoritmo desconocido: '{algorithm}'. "
-            f"Opciones válidas: 'wlc', 'ahp'."
+        if algorithm == "wlc":
+            _banner("PASO 4 – WLC: entrenando Random Forest para derivar pesos")
+            _, weights_local, labels_local = get_rf_weights(
+                norm_df_local,
+                norm_cols,
+                suitability_threshold=cfg["label_threshold"],
+                n_estimators=cfg["rf_n_estimators"],
+                seed=cfg["rf_seed"],
+            )
+            print("\n[WLC] Pesos derivados del Random Forest (MDI):")
+            for col, w in sorted(weights_local.items(), key=lambda x: -x[1]):
+                print(f"  {col:30s}  {w:.4f}  {'█' * int(w * 40)}")
+
+        elif algorithm == "ahp":
+            _banner("PASO 4 – AHP: calculando pesos desde matriz de comparación")
+
+            pairwise_matrix = build_pairwise_matrix(AHP_CRITERIA, AHP_COMPARISONS)
+            weights_local, lambda_max, cr, is_consistent = compute_ahp_weights(
+                pairwise_matrix, AHP_CRITERIA
+            )
+
+            print_ahp_report(weights_local, lambda_max, cr, is_consistent,
+                             pairwise_matrix, AHP_CRITERIA)
+
+            if not is_consistent:
+                print("\n  ⚠  CR >= 0.10 — los juicios son inconsistentes.")
+                print("     Revisa AHP_COMPARISONS en main.py y ajusta los valores.")
+                print("     El pipeline continúa pero los pesos pueden no ser fiables.")
+
+            for col in norm_cols:
+                if col not in weights_local:
+                    weights_local[col] = 0.0
+
+        elif algorithm == "bwm":
+            _banner("PASO 4 – BWM: calculando pesos y ranking PROMETHEE II")
+
+            weights_local = compute_bwm_weights(
+                BWM_BEST_TO_OTHERS,
+                BWM_OTHERS_TO_WORST,
+                AHP_CRITERIA,
+            )
+
+            print("\n[BWM] Pesos calculados:")
+            for col in AHP_CRITERIA:
+                print(f"  {col:30s}  {weights_local[col]:.4f}")
+            print(f"  Suma total: {sum(weights_local.values()):.6f}")
+
+        else:
+            raise ValueError(
+                f"Algoritmo desconocido: '{algorithm}'. "
+                f"Opciones válidas: 'wlc', 'ahp', 'bwm'."
+            )
+
+        # ------------------------------------------------------------------
+        # Paso 5 – Puntuaciones MCDA
+        # ------------------------------------------------------------------
+        _banner("PASO 5 – Calculando puntuaciones de aptitud")
+
+        if algorithm == "wlc":
+            scored_df_local = compute_wlc_scores(
+                norm_df_local, weights_local, norm_cols,
+                score_column=cfg["score_column"],
+            )
+        elif algorithm == "ahp":
+            scored_df_local = compute_ahp_scores(
+                norm_df_local, weights_local, norm_cols,
+                score_column=cfg["score_column"],
+            )
+        else:  # bwm
+            scored_df_local = compute_promethee_scores(
+                norm_df=norm_df_local,
+                weights=weights_local,
+                criteria=AHP_CRITERIA,
+                preference_functions=BWM_PREFERENCE_FUNCTIONS,
+                score_column=cfg["score_column"],
+            )
+
+        # ------------------------------------------------------------------
+        # Paso 6 – Ranking
+        # ------------------------------------------------------------------
+        _banner("PASO 6 – Ranking de localidades candidatas")
+        ranked_df_local = rank_locations(
+            scored_df_local,
+            score_column=cfg["score_column"],
+            top_n=None,
+            protected_threshold=cfg["protected_threshold"],
         )
+        summarise_top_locations(ranked_df_local, top_n=cfg["top_n"],
+                                 score_column=cfg["score_column"])
 
-    # ------------------------------------------------------------------
-    # Paso 5 – Puntuaciones MCDA
-    # ------------------------------------------------------------------
-    _banner("PASO 5 – Calculando puntuaciones de aptitud")
+        return {
+            "algorithm": algorithm,
+            "norm_cols": norm_cols,
+            "weights": weights_local,
+            "labels": labels_local if labels_local is not None else [],
+            "scored_records": _to_records(scored_df_local),
+            "ranked_records": _to_records(ranked_df_local),
+        }
 
-    if algorithm == "wlc":
-        scored_df = compute_wlc_scores(
-            norm_df, weights, norm_cols,
-            score_column=config["score_column"],
-        )
-    else:  # ahp
-        scored_df = compute_ahp_scores(
-            norm_df, weights, norm_cols,
-            score_column=config["score_column"],
-        )
+    cache_model_name = "bwm_promethee" if algorithm == "bwm" else algorithm
+    cache_config = {
+        "algorithm": algorithm,
+        "resolution": config["resolution"],
+        "feature_seed": config["feature_seed"],
+        "norm_method": config["norm_method"],
+        "rf_n_estimators": config["rf_n_estimators"],
+        "rf_seed": config["rf_seed"],
+        "label_threshold": config["label_threshold"],
+        "protected_threshold": config["protected_threshold"],
+        "top_n": config["top_n"],
+        "score_column": config["score_column"],
+        "geojson_path": config["geojson_path"],
+        "municipios_path": config["municipios_path"],
+    }
 
-    # ------------------------------------------------------------------
-    # Paso 6 – Ranking
-    # ------------------------------------------------------------------
-    _banner("PASO 6 – Ranking de localidades candidatas")
-    ranked_df = rank_locations(
-        scored_df,
-        score_column=config["score_column"],
-        top_n=None,
-        protected_threshold=config["protected_threshold"],
+    cache_result = get_or_run(
+        model_name=cache_model_name,
+        config=cache_config,
+        run_function=_run_model,
+        force_rerun=bool(config.get("force_rerun", False)),
     )
-    summarise_top_locations(ranked_df, top_n=config["top_n"],
-                             score_column=config["score_column"])
+
+    expected_keys = {"weights", "scored_records", "ranked_records"}
+    if not expected_keys.issubset(cache_result.keys()):
+        print(
+            "[Cache] Formato antiguo o incompleto detectado; "
+            "se recalculará y actualizará el archivo JSON."
+        )
+        cache_result = get_or_run(
+            model_name=cache_model_name,
+            config=cache_config,
+            run_function=_run_model,
+            force_rerun=True,
+        )
+
+    weights = cache_result["weights"]
+    labels = cache_result.get("labels") or None
+    norm_cols = cache_result.get("norm_cols", norm_cols)
+    scored_df = _from_records(cache_result["scored_records"])
+    ranked_df = _from_records(cache_result["ranked_records"])
+    norm_df = scored_df.copy()
+    hex_grid = None
+    features_df = None
 
     # ------------------------------------------------------------------
     # Paso 7 – Visualización y exportación
@@ -380,10 +507,12 @@ def _show_menu() -> Dict[str, Any]:
     print("       Pesos derivados automáticamente por Random Forest\n")
     print("    2. AHP  (Analytic Hierarchy Process)")
     print("       Pesos fijos basados en literatura eólica\n")
+    print("    3. BWM + PROMETHEE II")
+    print("       Pesos por Best Worst Method y ranking por PROMETHEE II\n")
     print("=" * 50)
 
     while True:
-        opcion = input("\n  Ingresa 1 o 2: ").strip()
+        opcion = input("\n  Ingresa 1 o 2 o 3: ").strip()
         if opcion == "1":
             algorithm = "wlc"
             print("\n  ✓ Seleccionado: WLC + Random Forest")
@@ -392,8 +521,12 @@ def _show_menu() -> Dict[str, Any]:
             algorithm = "ahp"
             print("\n  ✓ Seleccionado: AHP")
             break
+        elif opcion == "3":
+            algorithm = "bwm"
+            print("\n  ✓ Seleccionado: BWM + PROMETHEE II")
+            break
         else:
-            print("  Opción inválida. Por favor ingresa 1 o 2.")
+            print("  Opción inválida. Por favor ingresa 1, 2 o 3.")
 
     config = dict(DEFAULT_CONFIG)
     config["algorithm"] = algorithm

@@ -338,6 +338,14 @@ def create_interactive_map(
     except ImportError:
         raise ImportError("Instala Folium:  pip install folium")
 
+    required_cols = {"lat", "lon", score_column}
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+      raise ValueError(
+        "create_interactive_map requiere columnas: "
+        f"{sorted(required_cols)}. Faltan: {missing}"
+      )
+
     n = len(df)
     print(f"[Map] Construyendo mapa multi-LOD | {n:,} hexagonos | zoom={zoom}")
 
