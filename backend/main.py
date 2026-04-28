@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib
 import sys
 import os
-import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -280,16 +279,6 @@ def run_model(req: RunModelRequest):
 
         # Ejecutar pipeline maestro
         result = master_main.run_pipeline(cfg)
-
-        # Si existe frontend, copiar el mapa generado a frontend/index.html para que el UI lo cargue
-        try:
-            map_src = os.path.join(master_main.DEFAULT_CONFIG.get("output_dir", "outputs"), "map_interactive.html")
-            if FRONTEND_DIR.exists() and os.path.exists(map_src):
-                dst = FRONTEND_DIR / "index.html"
-                shutil.copy(map_src, dst)
-                print(f"[API] Copiado mapa a: {dst}")
-        except Exception as e:
-            print(f"[API] Aviso: no se pudo copiar el mapa al frontend: {e}")
 
         # Normalizar salida: convertir DataFrames a registros JSON serializables
         scored = result.get("scored_df") or result.get("scored_records")

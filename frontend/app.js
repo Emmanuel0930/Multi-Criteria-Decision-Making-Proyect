@@ -16,7 +16,7 @@
 // Configuración
 // ─────────────────────────────────────────────────────────────────────────────
 
-const API_BASE    = "http://localhost:8000";    // URL del backend FastAPI
+const API_BASE    = window.location.origin;      // Backend same-origin (/app, /models, /run-model)
 const CENTRE_LAT  = 4.711;
 const CENTRE_LON  = -74.072;
 const INIT_ZOOM   = 6;
@@ -43,10 +43,16 @@ let canvasRenderer = null;
 let activeLayers  = [];           // capas activas en el mapa
 let renderTimer   = null;         // debounce timer
 let selectedLayer = null;         // capa actualmente seleccionada
+let currentHex    = null;         // hex seleccionado para acciones de grupo
 let currentModel  = null;         // datos del modelo cargado { lod0, lod1, lod3, ... }
 let muniTable     = [];
 let deptTable     = [];
 let diviTable     = [];
+let groups        = {};
+let groupOrder    = [];
+let activeGroup   = "";
+
+const GROUP_COLORS = ["#38bdf8", "#a78bfa", "#f59e0b", "#34d399", "#fb7185", "#f97316", "#22d3ee"];
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +112,147 @@ function updateLodHud() {
     `LOD${lodNum} · zoom ${z} · ${desc}`;
 }
 
+function getGroupColor(name) {
+  const idx = groupOrder.indexOf(name);
+  if (idx < 0) return "#64748b";
+  return GROUP_COLORS[idx % GROUP_COLORS.length];
+}
+
+function findGroupForHex(hexId) {
+  for (const name of groupOrder) {
+    const items = groups[name].items;
+    for (const item of items) {
+      if (item.hexId === hexId) return name;
+    }
+  }
+  return null;
+}
+
+function renderGroupSelector() {
+  const sel = document.getElementById("grp-active");
+  if (!sel) return;
+
+  if (activeGroup && !groups[activeGroup]) activeGroup = "";
+
+  let html = "";
+  if (!groupOrder.length) {
+    html = '<option value="" selected>Sin grupos</option>';
+    sel.innerHTML = html;
+    return;
+  }
+
+  for (const name of groupOrder) {
+    const selected = name === activeGroup ? " selected" : "";
+    html += `<option value="${name}"${selected}>${name} (${groups[name].items.length})</option>`;
+  }
+
+  sel.innerHTML = html;
+  sel.value = activeGroup;
+  if (!activeGroup) sel.selectedIndex = -1;
+}
+
+function renderGroupCompareTable() {
+  const table = document.getElementById("grp-table");
+  const body = document.getElementById("grp-body");
+  const empty = document.getElementById("grp-empty");
+  if (!table || !body || !empty) return;
+
+  const rows = [];
+  for (const name of groupOrder) {
+    const items = groups[name].items;
+    if (!items.length) continue;
+    const sum = items.reduce((acc, it) => acc + it.score, 0);
+    const best = items.reduce((mx, it) => Math.max(mx, it.score), items[0].score);
+    rows.push({
+      name,
+      count: items.length,
+      avg: sum / items.length,
+      best,
+      color: getGroupColor(name),
+    });
+  }
+
+  if (!rows.length) {
+    table.style.display = "none";
+    empty.style.display = "block";
+    body.innerHTML = "";
+    renderGroupSelector();
+    return;
+  }
+
+  const winner = rows.reduce((mx, r) => Math.max(mx, r.avg), rows[0].avg);
+
+  table.style.display = "table";
+  empty.style.display = "none";
+  body.innerHTML = rows.map(r => {
+    const state = Math.abs(r.avg - winner) < 1e-9 ? '<span class="cmp-best">MEJOR</span>' : "-";
+    return `<tr>
+      <td><span class="cmp-group-chip" style="background:${r.color}"></span>${r.name}</td>
+      <td>${r.count}</td>
+      <td class="cmp-score">${r.avg.toFixed(4)}</td>
+      <td>${r.best.toFixed(4)}</td>
+      <td>${state}</td>
+    </tr>`;
+  }).join("");
+
+  renderGroupSelector();
+}
+
+function createGroup() {
+  const input = document.getElementById("grp-name");
+  if (!input) return;
+  const name = (input.value || "").trim();
+  if (!name) return;
+
+  if (!groups[name]) {
+    groups[name] = { name, items: [] };
+    groupOrder.push(name);
+  }
+  activeGroup = name;
+  input.value = "";
+  renderGroupCompareTable();
+  renderViewport();
+  setStatus("fresh", `Grupo activo: ${name}`);
+}
+
+function leaveActiveGroup() {
+  activeGroup = "";
+  renderGroupSelector();
+  renderViewport();
+}
+
+function addCurrentToActiveGroup() {
+  if (!currentHex || !activeGroup || !groups[activeGroup]) return;
+  const items = groups[activeGroup].items;
+  if (items.some(it => it.hexId === currentHex.hexId)) return;
+  items.push(currentHex);
+  renderGroupCompareTable();
+  renderViewport();
+}
+
+function removeCurrentFromActiveGroup() {
+  if (!currentHex || !activeGroup || !groups[activeGroup]) return;
+  groups[activeGroup].items = groups[activeGroup].items.filter(it => it.hexId !== currentHex.hexId);
+  renderGroupCompareTable();
+  renderViewport();
+}
+
+function clearActiveGroup() {
+  if (!activeGroup || !groups[activeGroup]) return;
+  groups[activeGroup].items = [];
+  renderGroupCompareTable();
+  renderViewport();
+}
+
+function deleteActiveGroup() {
+  if (!activeGroup || !groups[activeGroup]) return;
+  delete groups[activeGroup];
+  groupOrder = groupOrder.filter(name => name !== activeGroup);
+  activeGroup = "";
+  renderGroupCompareTable();
+  renderViewport();
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Panel derecho
@@ -117,6 +264,15 @@ function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi
   document.getElementById("rp-close").style.display       = "block";
 
   const hexId = buildHexId(lat, lon);
+  currentHex = {
+    hexId,
+    score,
+    muni: muniTable[mi] || "—",
+    dept: deptTable[di] || "—",
+    rank,
+    lat,
+    lon,
+  };
   document.getElementById("rp-hex-id").textContent = hexId;
 
   document.getElementById("rp-score-value").textContent = (score * 10).toFixed(1);
@@ -143,6 +299,9 @@ function showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi
     <div class="detail-cell"><div class="dc-label">Riesgo</div>
       <div class="dc-value">${cr.toFixed(3)}</div></div>
   `;
+
+  const autoAdd = document.getElementById("grp-auto-add");
+  if (autoAdd && autoAdd.checked) addCurrentToActiveGroup();
 }
 
 function hideHexAnalysis() {
@@ -157,6 +316,7 @@ function hideHexAnalysis() {
     });
   }
   selectedLayer = null;
+  currentHex = null;
 }
 
 document.getElementById("rp-close").addEventListener("click", hideHexAnalysis);
@@ -191,8 +351,12 @@ function renderLOD1(data, bounds, radius) {
     const [lat, lon, score, rank, mi, di, dpi, ws, slope, dg, dr, lu, pa, cr] = row;
     if (lat < sw.lat || lat > ne.lat || lon < sw.lng || lon > ne.lng) continue;
 
-    const baseColor  = "rgba(255,255,255,0.15)";
-    const baseWeight = 0.5;
+    const hexId = buildHexId(lat, lon);
+    const groupName = findGroupForHex(hexId);
+    const groupColor = groupName ? getGroupColor(groupName) : null;
+
+    const baseColor  = groupColor || "rgba(255,255,255,0.15)";
+    const baseWeight = groupColor ? 1.8 : 0.5;
     const cm = L.circleMarker([lat, lon], {
       renderer: canvasRenderer, radius,
       fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
@@ -226,8 +390,12 @@ function renderLOD3(data, bounds) {
     const clon = (verts[1][1] + verts[4][1]) / 2;
     if (clat < sw.lat || clat > ne.lat || clon < sw.lng || clon > ne.lng) continue;
 
-    const baseColor  = "rgba(255,255,255,0.08)";
-    const baseWeight = 0.6;
+    const hexId = buildHexId(clat, clon);
+    const groupName = findGroupForHex(hexId);
+    const groupColor = groupName ? getGroupColor(groupName) : null;
+
+    const baseColor  = groupColor || "rgba(255,255,255,0.08)";
+    const baseWeight = groupColor ? 2.0 : 0.6;
     const poly = L.polygon(verts, {
       renderer: canvasRenderer,
       fillColor: scoreToColor(score), fillOpacity: 0.2 + 0.6 * score,
@@ -395,6 +563,11 @@ async function loadModel() {
     deptTable = data.params?.dept_table || [];
     diviTable = data.params?.divi_table || [];
 
+    groups = {};
+    groupOrder = [];
+    activeGroup = "";
+    renderGroupCompareTable();
+
     showLegend(true);
     renderViewport();
 
@@ -433,6 +606,39 @@ document.getElementById("model-select").addEventListener("change", function () {
 
 document.getElementById("load-btn").addEventListener("click", loadModel);
 
+const grpCreate = document.getElementById("grp-create");
+if (grpCreate) grpCreate.addEventListener("click", createGroup);
+
+const grpLeave = document.getElementById("grp-leave");
+if (grpLeave) grpLeave.addEventListener("click", leaveActiveGroup);
+
+const grpAdd = document.getElementById("grp-add-current");
+if (grpAdd) grpAdd.addEventListener("click", addCurrentToActiveGroup);
+
+const grpRemove = document.getElementById("grp-remove-current");
+if (grpRemove) grpRemove.addEventListener("click", removeCurrentFromActiveGroup);
+
+const grpClear = document.getElementById("grp-clear");
+if (grpClear) grpClear.addEventListener("click", clearActiveGroup);
+
+const grpDelete = document.getElementById("grp-delete");
+if (grpDelete) grpDelete.addEventListener("click", deleteActiveGroup);
+
+const grpActive = document.getElementById("grp-active");
+if (grpActive) {
+  grpActive.addEventListener("change", function () {
+    activeGroup = this.value || "";
+    renderViewport();
+  });
+}
+
+const grpName = document.getElementById("grp-name");
+if (grpName) {
+  grpName.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") createGroup();
+  });
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
@@ -440,5 +646,6 @@ document.getElementById("load-btn").addEventListener("click", loadModel);
 
 window.addEventListener("load", () => {
   initMap();
+  renderGroupCompareTable();
   fetchModels();     // decorar opciones del select con ✓ si ya tienen caché
 });

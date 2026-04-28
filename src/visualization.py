@@ -335,18 +335,8 @@ def create_interactive_map(
     try:
         import folium
         from folium.plugins import MiniMap, Fullscreen
-        has_folium = True
     except ImportError:
-        has_folium = False
-        print('[Map] Folium no instalado — usando fallback Leaflet simple')
-
-    required_cols = {"lat", "lon", score_column}
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(
-            "create_interactive_map requiere columnas: "
-            f"{sorted(required_cols)}. Faltan: {missing}"
-        )
+        raise ImportError("Instala Folium:  pip install folium")
 
     n = len(df)
     print(f"[Map] Construyendo mapa multi-LOD | {n:,} hexagonos | zoom={zoom}")
@@ -356,44 +346,6 @@ def create_interactive_map(
         _build_lod_payload(df, score_column)
     top_js = _build_top_n_js(df, score_column, top_n_highlight)
 
-    if not has_folium:
-        # Fallback ligero: generar HTML con Leaflet y marcadores desde LOD1
-        try:
-            html = f"""<!doctype html>
-<html>
-<head>
-<meta charset=\"utf-8\" />
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-<title>Mapa MCDM (fallback)</title>
-<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
-<style>html,body,#map{{height:100%;margin:0;padding:0;}}body{{background:#0d1117;color:#e2e8f0}}</style>
-</head>
-<body>
-<div id=\"map\"></div>
-<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
-<script>
-var LOD1 = {lod1_js};
-var centre = [{centre_lat}, {centre_lon}];
-var map = L.map('map').setView(centre, {zoom});
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {{maxZoom: 18}}).addTo(map);
-function scoreColor(s){{ if(s>=0.7) return '#1a9850'; if(s>=0.35) return '#fee08b'; return '#d73027'; }}
-LOD1.forEach(function(r){{
-  var lat = r[0], lon = r[1], score = r[2], rank = r[3];
-  var c = scoreColor(score);
-  var circle = L.circleMarker([lat, lon], {{radius: 6, fillColor: c, color: '#111', weight:1, fillOpacity:0.9}}).addTo(map);
-  circle.bindPopup(`<b>Rank:</b> ${rank}<br/><b>Score:</b> ${score}`);
-}});
-</script>
-</body>
-</html>"""
-            with open(output_path, 'w', encoding='utf-8') as fh:
-                fh.write(html)
-            print(f"[Map] Fallback leaflet HTML guardado en {output_path}")
-            return
-        except Exception as e:
-            raise RuntimeError(f"No se pudo generar el mapa fallback: {e}")
-    
-    # Proceed with Folium branch
     # 2. Mapa base Folium
     m = folium.Map(
         location=[centre_lat, centre_lon],
@@ -455,7 +407,22 @@ LOD1.forEach(function(r){{
   #dss-topbar .separator {{ width: 1px; height: 28px; background: #1e2a3a; margin: 0 20px; }}
   #dss-topbar .subtitle {{ font-size: 11px; font-weight: 500; color: #64748b; letter-spacing: 1.5px; text-transform: uppercase; }}
   #dss-topbar .spacer {{ flex: 1; }}
-  #dss-topbar .version {{ font-size: 11px; color: #475569; letter-spacing: 0.5px; }}
+  #dss-topbar .model-controls {{ display:flex; align-items:center; gap:8px; }}
+  #top-model-select {{
+    height: 30px; min-width: 178px;
+    border: 1px solid #1e2a3a; border-radius: 6px;
+    background: #0f1724; color: #cbd5e1;
+    font-size: 11px; padding: 0 8px;
+  }}
+  #top-load-btn {{
+    height: 30px; border: 1px solid #1e40af; border-radius: 6px;
+    background: #13253d; color: #93c5fd;
+    font-size: 11px; font-weight: 600; padding: 0 10px;
+    cursor: pointer;
+  }}
+  #top-load-btn:hover {{ background: #1a3456; }}
+  #top-load-btn:disabled {{ opacity: 0.6; cursor: wait; }}
+  #top-model-status {{ font-size: 10px; color: #64748b; min-width: 86px; text-align: right; }}
   #dss-topbar .share-btn {{
     margin-left: 14px; width: 30px; height: 30px;
     border: 1px solid #1e2a3a; border-radius: 6px;
@@ -660,7 +627,15 @@ LOD1.forEach(function(r){{
     </div>
     <div class="separator"></div>
     <div class="spacer"></div>
-    <div class="version">Proyecto de investigación</div>
+    <div class="model-controls">
+      <select id="top-model-select" title="Seleccionar metodo">
+        <option value="ahp">AHP + WLC</option>
+        <option value="wlc">WLC (Random Forest)</option>
+        <option value="bwm">BWM + PROMETHEE II</option>
+      </select>
+      <button id="top-load-btn" type="button">Cargar</button>
+      <span id="top-model-status"></span>
+    </div>
   </div>
 
   <div id="dss-body">
@@ -670,42 +645,42 @@ LOD1.forEach(function(r){{
       <div class="panel-section-title">Ponderacion de Criterios (Fijo)</div>
 
       <div class="crit-category">
-    <div class="crit-category-header">
-      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <path d="M12 2a10 10 0 0 1 0 20A10 10 0 0 1 12 2z"/><path d="M12 6v6l4 2"/>
-      </svg>
-      A. Meteorologicos (45%)
-    </div>
-    <div class="crit-row"><span class="crit-label">Velocidad Viento (Avg)</span><span class="crit-badge">25%</span></div>
-    <div class="crit-row"><span class="crit-label">Densidad del Aire</span><span class="crit-badge">10%</span></div>
-    <div class="crit-row"><span class="crit-label">Indice de Turbulencia</span><span class="crit-badge">10%</span></div>
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M12 2a10 10 0 0 1 0 20A10 10 0 0 1 12 2z"/><path d="M12 6v6l4 2"/>
+          </svg>
+          A. Meteorologicos (45%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Velocidad Viento (Avg)</span><span class="crit-badge">25%</span></div>
+        <div class="crit-row"><span class="crit-label">Densidad del Aire</span><span class="crit-badge">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Indice de Turbulencia</span><span class="crit-badge">10%</span></div>
       </div>
 
       <div class="crit-category">
-    <div class="crit-category-header">
-      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M19.07 4.93A10 10 0 0 1 21 12a10 10 0 0 1-1.93 5.07"/>
-        <path d="M4.93 4.93A10 10 0 0 0 3 12a10 10 0 0 0 1.93 5.07"/>
-      </svg>
-      B. Tecnicos y Suelo (35%)
-    </div>
-    <div class="crit-row"><span class="crit-label">Cercania a Red Electrica</span><span class="crit-badge">15%</span></div>
-    <div class="crit-row"><span class="crit-label">Pendiente Maxima</span><span class="crit-badge">10%</span></div>
-    <div class="crit-row"><span class="crit-label">Accesibilidad Vial</span><span class="crit-badge">5%</span></div>
-    <div class="crit-row"><span class="crit-label">Capacidad Portante Suelo</span><span class="crit-badge">5%</span></div>
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.07 4.93A10 10 0 0 1 21 12a10 10 0 0 1-1.93 5.07"/>
+            <path d="M4.93 4.93A10 10 0 0 0 3 12a10 10 0 0 0 1.93 5.07"/>
+          </svg>
+          B. Tecnicos y Suelo (35%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Cercania a Red Electrica</span><span class="crit-badge">15%</span></div>
+        <div class="crit-row"><span class="crit-label">Pendiente Maxima</span><span class="crit-badge">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Accesibilidad Vial</span><span class="crit-badge">5%</span></div>
+        <div class="crit-row"><span class="crit-label">Capacidad Portante Suelo</span><span class="crit-badge">5%</span></div>
       </div>
 
       <div class="crit-category">
-    <div class="crit-category-header">
-      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-        <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-      </svg>
-      C. Socio-Ambientales (20%)
-    </div>
-    <div class="crit-row"><span class="crit-label">Zonas Protegidas</span><span class="crit-badge excluded">EXCLUIDO</span></div>
-    <div class="crit-row"><span class="crit-label">Riesgo de Conflicto</span><span class="crit-badge orange">10%</span></div>
-    <div class="crit-row"><span class="crit-label">Uso del Suelo</span><span class="crit-badge green">10%</span></div>
+        <div class="crit-category-header">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          </svg>
+          C. Socio-Ambientales (20%)
+        </div>
+        <div class="crit-row"><span class="crit-label">Zonas Protegidas</span><span class="crit-badge excluded">EXCLUIDO</span></div>
+        <div class="crit-row"><span class="crit-label">Riesgo de Conflicto</span><span class="crit-badge orange">10%</span></div>
+        <div class="crit-row"><span class="crit-label">Uso del Suelo</span><span class="crit-badge green">10%</span></div>
       </div>
     </div>
 
@@ -713,79 +688,79 @@ LOD1.forEach(function(r){{
     <div id="dss-map-area">
       <div id="lod-hud">zoom 6 - vista region</div>
       <div id="dss-legend">
-    <div class="leg-title">Puntuación de idoneidad</div>
-    <div class="leg-bar" id="leg-gradient"></div>
-    <div class="leg-labels">
-      <span>0</span><span>2</span><span>4</span><span>6</span><span>8</span><span>10</span>
-    </div>
-    <div class="leg-note">* Top-{top_n_highlight} candidatos</div>
+        <div class="leg-title">Puntuación de idoneidad</div>
+        <div class="leg-bar" id="leg-gradient"></div>
+        <div class="leg-labels">
+          <span>0</span><span>2</span><span>4</span><span>6</span><span>8</span><span>10</span>
+        </div>
+        <div class="leg-note">* Top-{top_n_highlight} candidatos</div>
       </div>
     </div>
 
     <!-- Right panel: Multicriteria analysis -->
     <div id="dss-right">
       <div id="rp-placeholder">
-    <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-      <circle cx="12" cy="10" r="3"/>
-    </svg>
-    <p>Haz clic en un hexagono del mapa para ver su analisis multicriterio</p>
+        <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+          <circle cx="12" cy="10" r="3"/>
+        </svg>
+        <p>Haz clic en un hexagono del mapa para ver su analisis multicriterio</p>
       </div>
 
       <div id="rp-content" style="display:none;">
-    <div class="rp-section-label">Analisis Multicriterio</div>
-    <div id="rp-hex-id">-</div>
-    <button id="rp-close">x</button>
+        <div class="rp-section-label">Analisis Multicriterio</div>
+        <div id="rp-hex-id">-</div>
+        <button id="rp-close">x</button>
 
-    <div id="rp-score-card">
-      <div class="sc-label">Puntuación</div>
-      <div class="sc-value" id="rp-score-value">-</div>
-      <div class="sc-sub" id="rp-score-sub">-</div>
-    </div>
+        <div id="rp-score-card">
+          <div class="sc-label">Puntuación</div>
+          <div class="sc-value" id="rp-score-value">-</div>
+          <div class="sc-sub" id="rp-score-sub">-</div>
+        </div>
 
-    <hr class="rp-divider">
-    <div class="detail-grid" id="rp-detail-grid"></div>
+        <hr class="rp-divider">
+        <div class="detail-grid" id="rp-detail-grid"></div>
 
-    <div class="cmp-section">
-      <div class="cmp-head">
-        <div class="cmp-title">Grupos de Cuadriculas</div>
-      </div>
+        <div class="cmp-section">
+          <div class="cmp-head">
+            <div class="cmp-title">Grupos de Cuadriculas</div>
+          </div>
 
-      <input id="grp-name" class="cmp-input" type="text" placeholder="Nombre del grupo (ej: Norte Viento Alto)">
-      <div class="cmp-row">
-        <button id="grp-create" class="cmp-btn primary">Crear grupo</button>
-        <button id="grp-leave" class="cmp-btn">Dejar grupo</button>
-      </div>
+          <input id="grp-name" class="cmp-input" type="text" placeholder="Nombre del grupo (ej: Norte Viento Alto)">
+          <div class="cmp-row">
+            <button id="grp-create" class="cmp-btn primary">Crear grupo</button>
+            <button id="grp-leave" class="cmp-btn">Dejar grupo</button>
+          </div>
 
-      <select id="grp-active" class="cmp-select"></select>
-      <div class="cmp-row">
-        <button id="grp-add-current" class="cmp-btn primary">Agregar seleccion actual</button>
-        <button id="grp-remove-current" class="cmp-btn">Quitar actual</button>
-      </div>
-      <label class="cmp-toggle">
-        <input id="grp-auto-add" type="checkbox" checked>
-        Auto agregar al grupo activo al hacer clic
-      </label>
-      <div class="cmp-row">
-        <button id="grp-clear" class="cmp-btn">Vaciar grupo</button>
-        <button id="grp-delete" class="cmp-btn">Eliminar grupo</button>
-      </div>
+          <select id="grp-active" class="cmp-select"></select>
+          <div class="cmp-row">
+            <button id="grp-add-current" class="cmp-btn primary">Agregar seleccion actual</button>
+            <button id="grp-remove-current" class="cmp-btn">Quitar actual</button>
+          </div>
+          <label class="cmp-toggle">
+            <input id="grp-auto-add" type="checkbox" checked>
+            Auto agregar al grupo activo al hacer clic
+          </label>
+          <div class="cmp-row">
+            <button id="grp-clear" class="cmp-btn">Vaciar grupo</button>
+            <button id="grp-delete" class="cmp-btn">Eliminar grupo</button>
+          </div>
 
-      <div class="cmp-hint">Compara grupos por score promedio y mejor celda.</div>
-      <div id="grp-empty" class="cmp-empty">Crea al menos un grupo y agrega cuadriculas para comparar.</div>
-      <table id="grp-table" class="cmp-table" style="display:none;">
-        <thead>
-          <tr>
-            <th>Grupo</th>
-            <th>#</th>
-            <th>Prom</th>
-            <th>Mejor</th>
-            <th>Estado</th>
-          </tr>
-        </thead>
-        <tbody id="grp-body"></tbody>
-      </table>
-    </div>
+          <div class="cmp-hint">Compara grupos por score promedio y mejor celda.</div>
+          <div id="grp-empty" class="cmp-empty">Crea al menos un grupo y agrega cuadriculas para comparar.</div>
+          <table id="grp-table" class="cmp-table" style="display:none;">
+            <thead>
+              <tr>
+                <th>Grupo</th>
+                <th>#</th>
+                <th>Prom</th>
+                <th>Mejor</th>
+                <th>Estado</th>
+              </tr>
+            </thead>
+            <tbody id="grp-body"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -797,7 +772,7 @@ LOD1.forEach(function(r){{
 (function() {{
   var bar = document.getElementById('leg-gradient');
   var palette = ["#a50026","#d73027","#f46d43","#fdae61","#fee08b",
-             "#ffffbf","#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"];
+                 "#ffffbf","#d9ef8b","#a6d96a","#66bd63","#1a9850","#006837"];
   bar.innerHTML = palette.map(function(c) {{
     return '<span style="background:' + c + ';flex:1;display:inline-block;height:12px;"></span>';
   }}).join('');
@@ -946,11 +921,11 @@ function renderGroupCompareTable() {{
     var state = isBest ? '<span class="cmp-best">MEJOR</span>' : '<span>-</span>';
     html +=
       '<tr>' +
-    '<td><span class="cmp-group-chip" style="background:' + row.color + '"></span>' + row.name + '</td>' +
-    '<td>' + row.count + '</td>' +
-    '<td class="cmp-score">' + row.avg.toFixed(4) + '</td>' +
-    '<td>' + row.best.toFixed(4) + '</td>' +
-    '<td>' + state + '</td>' +
+        '<td><span class="cmp-group-chip" style="background:' + row.color + '"></span>' + row.name + '</td>' +
+        '<td>' + row.count + '</td>' +
+        '<td class="cmp-score">' + row.avg.toFixed(4) + '</td>' +
+        '<td>' + row.best.toFixed(4) + '</td>' +
+        '<td>' + state + '</td>' +
       '</tr>';
   }}
   body.innerHTML = html;
@@ -1097,26 +1072,26 @@ function renderCircles(map, data, bounds, radius, interactive) {{
       var baseColor = groupColor || (interactive ? "rgba(255,255,255,0.15)" : "none");
       var baseWeight = groupColor ? 1.8 : (interactive ? 0.5 : 0);
       var cm = L.circleMarker([lat, lon], {{
-    renderer: canvasRenderer, radius: radius,
-    fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
-    color: baseColor,
-    weight: baseWeight,
-    interactive: interactive
+        renderer: canvasRenderer, radius: radius,
+        fillColor: scoreToColor(score), fillOpacity: 0.35 + 0.55 * score,
+        color: baseColor,
+        weight: baseWeight,
+        interactive: interactive
       }});
       cm._baseColor = baseColor;
       cm._baseWeight = baseWeight;
       if (interactive) {{
-    cm.on('click', function(e) {{
-      if (selectedLayer && selectedLayer !== cm && selectedLayer.setStyle) {{
-        selectedLayer.setStyle({{
-          color: selectedLayer._baseColor || "rgba(255,255,255,0.15)",
-          weight: selectedLayer._baseWeight || 0.5,
+        cm.on('click', function(e) {{
+          if (selectedLayer && selectedLayer !== cm && selectedLayer.setStyle) {{
+            selectedLayer.setStyle({{
+              color: selectedLayer._baseColor || "rgba(255,255,255,0.15)",
+              weight: selectedLayer._baseWeight || 0.5,
+            }});
+          }}
+          cm.setStyle({{ color: "#60a5fa", weight: 2 }});
+          selectedLayer = cm;
+          showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, lat, lon);
         }});
-      }}
-      cm.setStyle({{ color: "#60a5fa", weight: 2 }});
-      selectedLayer = cm;
-      showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, lat, lon);
-    }});
       }}
       cm.addTo(map);
       activeLayers.push(cm);
@@ -1162,22 +1137,22 @@ function renderLOD3(map, bounds) {{
       var baseColor = groupColor || "rgba(255,255,255,0.08)";
       var baseWeight = groupColor ? 2.0 : 0.6;
       var poly = L.polygon(verts, {{
-    renderer: canvasRenderer,
-    fillColor: scoreToColor(score), fillOpacity: 0.2 + 0.6 * score,
-    color: baseColor, weight: baseWeight, interactive: true
+        renderer: canvasRenderer,
+        fillColor: scoreToColor(score), fillOpacity: 0.2 + 0.6 * score,
+        color: baseColor, weight: baseWeight, interactive: true
       }});
       poly._baseColor = baseColor;
       poly._baseWeight = baseWeight;
       poly.on('click', function(e) {{
-    if (selectedLayer && selectedLayer !== poly && selectedLayer.setStyle) {{
-      selectedLayer.setStyle({{
-        color: selectedLayer._baseColor || "rgba(255,255,255,0.08)",
-        weight: selectedLayer._baseWeight || 0.6,
-      }});
-    }}
-    poly.setStyle({{ color: "#60a5fa", weight: 2.5 }});
-    selectedLayer = poly;
-    showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, clat, clon);
+        if (selectedLayer && selectedLayer !== poly && selectedLayer.setStyle) {{
+          selectedLayer.setStyle({{
+            color: selectedLayer._baseColor || "rgba(255,255,255,0.08)",
+            weight: selectedLayer._baseWeight || 0.6,
+          }});
+        }}
+        poly.setStyle({{ color: "#60a5fa", weight: 2.5 }});
+        selectedLayer = poly;
+        showHexAnalysis(score, ws, slope, dg, dr, lu, pa, cr, rank, mi, di, dpi, clat, clon);
       }});
       poly.addTo(map);
       activeLayers.push(poly);
@@ -1217,12 +1192,12 @@ function addTopMarkers() {{
   for (var i = 0; i < TOP_N.length; i++) {{
     (function(t) {{
       var icon = L.divIcon({{
-    html: '<div style="font-size:20px;color:#fbbf24;text-shadow:0 0 6px rgba(251,191,36,0.6);line-height:1;cursor:pointer;">&#9733;</div>',
-    iconSize: [24, 24], iconAnchor: [12, 12], className: ''
+        html: '<div style="font-size:20px;color:#fbbf24;text-shadow:0 0 6px rgba(251,191,36,0.6);line-height:1;cursor:pointer;">&#9733;</div>',
+        iconSize: [24, 24], iconAnchor: [12, 12], className: ''
       }});
       L.marker([t.lat, t.lon], {{ icon: icon }})
-    .bindTooltip('#' + t.rank + ' · Score ' + t.score.toFixed(3) + ' · ' + t.muni, {{ direction: 'top', offset: [0, -8] }})
-    .addTo(map);
+        .bindTooltip('#' + t.rank + ' · Score ' + t.score.toFixed(3) + ' · ' + t.muni, {{ direction: 'top', offset: [0, -8] }})
+        .addTo(map);
     }})(TOP_N[i]);
   }}
 }}
@@ -1234,7 +1209,7 @@ function addLodHud() {{
   var hud = document.getElementById('lod-hud');
   if (!hud) return;
   var descs = {{5:'vista pais',6:'vista region',7:'vista regional',
-            8:'vista departamento',9:'vista local',10:'detalle completo'}};
+                8:'vista departamento',9:'vista local',10:'detalle completo'}};
   function update() {{
     var z = map.getZoom();
     var lodNum = z<=5?0:z<=7?1:3;
@@ -1244,10 +1219,60 @@ function addLodHud() {{
   update();
 }}
 
+// Model selector in top bar (backend /run-model)
+function bindTopModelSelector() {{
+  var sel = document.getElementById('top-model-select');
+  var btn = document.getElementById('top-load-btn');
+  var status = document.getElementById('top-model-status');
+  if (!sel || !btn || !status) return;
+
+  btn.addEventListener('click', function() {{
+    var modelId = sel.value;
+    if (!modelId) return;
+    btn.disabled = true;
+    status.textContent = 'Cargando...';
+
+    fetch('/run-model', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ model: modelId }})
+    }})
+      .then(function(res) {{
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      }})
+      .then(function(data) {{
+        LOD0 = data.lod0 || [];
+        LOD1 = data.lod1 || [];
+        LOD3 = data.lod3 || [];
+        MUNI_TABLE = (data.params && data.params.muni_table) || [];
+        DEPT_TABLE = (data.params && data.params.dept_table) || [];
+        DIVI_TABLE = (data.params && data.params.divi_table) || [];
+
+        groups = {{}};
+        groupOrder = [];
+        activeGroup = '';
+        renderGroupCompareTable();
+        hideHexAnalysis();
+        renderViewport();
+
+        status.textContent = data.from_cache ? 'Desde cache' : 'Recalculado';
+      }})
+      .catch(function(err) {{
+        console.error('[Model Selector] Error:', err);
+        status.textContent = 'Error';
+      }})
+      .finally(function() {{
+        btn.disabled = false;
+      }});
+  }});
+}}
+
 // Init
 function init() {{
   var map = getLeafletMap();
   if (!map) {{ setTimeout(init, 150); return; }}
+  bindTopModelSelector();
   renderGroupCompareTable();
   renderViewport();
   addTopMarkers();
