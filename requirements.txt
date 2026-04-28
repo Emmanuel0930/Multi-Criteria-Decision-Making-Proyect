@@ -1,0 +1,8 @@
+pandas
+numpy
+h3
+scikit-learn
+matplotlib
+folium
+fastapi
+uvicorn[standard]
