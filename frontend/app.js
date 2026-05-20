@@ -54,6 +54,69 @@ let activeGroup   = "";
 
 const GROUP_COLORS = ["#38bdf8", "#a78bfa", "#f59e0b", "#34d399", "#fb7185", "#f97316", "#22d3ee"];
 
+const CRITERIA_MODEL = {
+  wind_speed: {
+    title: "Velocidad del viento",
+    category: "Meteorológicos",
+    weight: "25%",
+    description: "Mide el potencial energético del recurso eólico. A mayor velocidad media del viento, mayor probabilidad de obtener una producción rentable y estable.",
+  },
+  air_density: {
+    title: "Densidad del aire",
+    category: "Meteorológicos",
+    weight: "10%",
+    description: "Ajusta el rendimiento esperado de las turbinas según la densidad atmosférica. Valores más altos suelen aumentar la energía extraíble en el mismo punto.",
+  },
+  turbulence_index: {
+    title: "Índice de turbulencia",
+    category: "Meteorológicos",
+    weight: "10%",
+    description: "Representa la variabilidad del flujo de aire. Una turbulencia alta incrementa cargas mecánicas y reduce la vida útil de los equipos, por lo que impacta negativamente la idoneidad.",
+  },
+  grid_proximity: {
+    title: "Cercanía a la red eléctrica",
+    category: "Técnicos y suelo",
+    weight: "15%",
+    description: "Evalúa cuánto cuesta conectar el proyecto al sistema eléctrico. Menores distancias reducen infraestructura adicional y disminuyen el costo total del parque.",
+  },
+  max_slope: {
+    title: "Pendiente máxima",
+    category: "Técnicos y suelo",
+    weight: "10%",
+    description: "Cuantifica la inclinación del terreno. Pendientes elevadas complican la construcción, el montaje y el mantenimiento, además de aumentar el riesgo geotécnico.",
+  },
+  road_accessibility: {
+    title: "Accesibilidad vial",
+    category: "Técnicos y suelo",
+    weight: "5%",
+    description: "Refleja la facilidad de acceso por carretera para transportar componentes, maquinaria y personal. Una mejor conectividad vial acelera la ejecución y reduce costos logísticos.",
+  },
+  bearing_capacity: {
+    title: "Capacidad portante",
+    category: "Técnicos y suelo",
+    weight: "5%",
+    description: "Indica la resistencia del suelo para soportar cimentaciones y cargas estructurales. Una mayor capacidad portante mejora la viabilidad técnica del emplazamiento.",
+  },
+  protected_areas: {
+    title: "Zonas protegidas",
+    category: "Socio-ambientales",
+    weight: "Excluido",
+    description: "Se usa como restricción ambiental. La presencia de áreas protegidas limita o excluye la instalación de aerogeneradores para minimizar impactos ecológicos y regulatorios.",
+  },
+  conflict_risk: {
+    title: "Riesgo de conflicto",
+    category: "Socio-ambientales",
+    weight: "10%",
+    description: "Captura la sensibilidad social y territorial del área. Un mayor riesgo de conflicto puede retrasar permisos, aumentar oposición local y comprometer la continuidad del proyecto.",
+  },
+  land_use: {
+    title: "Uso del suelo",
+    category: "Socio-ambientales",
+    weight: "10%",
+    description: "Evalúa la compatibilidad entre el uso actual del terreno y la implantación eólica. Suelos con usos más compatibles facilitan la aceptación y reducen conflictos de ocupación.",
+  },
+};
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilidades de color
@@ -69,6 +132,47 @@ function buildLegendGradient() {
   bar.innerHTML = PALETTE.map(c =>
     `<span style="background:${c};flex:1;display:inline-block;height:12px;"></span>`
   ).join("");
+}
+
+function toggleCriterionDescription(node, criterion) {
+  if (!node || !criterion) return;
+
+  const descId = `criterion-desc-${node.dataset.criterionId}`;
+  let desc = document.getElementById(descId);
+
+  if (!desc) {
+    desc = document.createElement("div");
+    desc.id = descId;
+    desc.className = "criterion-inline-desc";
+    desc.textContent = `${criterion.description}`;
+    node.insertAdjacentElement("afterend", desc);
+  }
+
+  const isOpen = desc.classList.contains("show");
+  desc.classList.toggle("show", !isOpen);
+  node.classList.toggle("is-open", !isOpen);
+  node.setAttribute("aria-expanded", (!isOpen).toString());
+}
+
+function bindCriterionDescriptions() {
+  const nodes = document.querySelectorAll(".criterion[data-criterion-id]");
+  nodes.forEach(node => {
+    const criterionId = node.dataset.criterionId;
+    const criterion = CRITERIA_MODEL[criterionId];
+    if (!criterion) return;
+
+    node.setAttribute("title", `Mostrar descripción: ${criterion.title}`);
+    node.setAttribute("aria-label", `${criterion.title}. Presiona para expandir o contraer su descripción.`);
+    node.setAttribute("aria-expanded", "false");
+
+    node.addEventListener("click", () => toggleCriterionDescription(node, criterion));
+    node.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleCriterionDescription(node, criterion);
+      }
+    });
+  });
 }
 
 
@@ -646,6 +750,7 @@ if (grpName) {
 
 window.addEventListener("load", () => {
   initMap();
+  bindCriterionDescriptions();
   renderGroupCompareTable();
   fetchModels();     // decorar opciones del select con ✓ si ya tienen caché
 });

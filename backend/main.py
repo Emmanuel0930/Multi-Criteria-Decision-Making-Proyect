@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -136,6 +136,17 @@ app = FastAPI(
     description="Backend para evaluación de aptitud eólica en Colombia con hexágonos H3",
     version="1.0.0",
 )
+
+
+@app.middleware("http")
+async def disable_frontend_cache(request: Request, call_next):
+    """Evita caché agresiva del navegador en el frontend durante desarrollo."""
+    response = await call_next(request)
+    if request.url.path.startswith("/app"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 # CORS: permite que el frontend (cualquier origen en desarrollo) consuma la API
 app.add_middleware(

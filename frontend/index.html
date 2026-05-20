@@ -160,8 +160,27 @@
       display: flex;
       justify-content: space-between;
       gap: 8px;
+      cursor: pointer;
+      outline: none;
+      transition: background 0.15s ease, transform 0.15s ease;
     }
     .criterion:last-child { border-bottom: none; }
+    .criterion:hover,
+    .criterion:focus-visible {
+      background: rgba(59, 130, 246, 0.08);
+      transform: translateX(2px);
+    }
+
+    .criterion > span:first-child::before {
+      content: "▶ ";
+      color: #8fb4e7;
+      font-size: 11px;
+    }
+
+    .criterion.is-open > span:first-child::before {
+      content: "▼ ";
+      color: #b9d6ff;
+    }
 
     .criterion .badge {
       font-size: 11px;
@@ -430,6 +449,30 @@
       margin-right: 6px;
     }
 
+    .criterion.is-open {
+      background: rgba(59, 130, 246, 0.1);
+    }
+
+    .criterion-inline-desc {
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      border-left: 2px solid #2f5f9d;
+      margin: 0 0 8px 8px;
+      padding: 0 10px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #a9bdd6;
+      background: rgba(20, 33, 51, 0.55);
+      transition: max-height 0.22s ease, opacity 0.2s ease, padding 0.2s ease;
+    }
+
+    .criterion-inline-desc.show {
+      max-height: 180px;
+      opacity: 1;
+      padding: 8px 10px;
+    }
+
     @media (max-width: 1100px) {
       #main { grid-template-columns: 1fr; }
       #left-panel, #right-panel { display: none; }
@@ -444,7 +487,7 @@
       <div class="spacer"></div>
       <select id="model-select">
         <option value="">Seleccionar metodo</option>
-        <option value="ahp">AHP + WLC</option>
+        <option value="ahp">AHP</option>
         <option value="wlc">WLC (Random Forest)</option>
         <option value="bwm">BWM + PROMETHEE II</option>
       </select>
@@ -457,24 +500,24 @@
 
         <div class="crit-category">
           <div class="crit-category-header"><span>A. Meteorologicos</span><span>45%</span></div>
-          <div class="criterion"><span>Velocidad viento</span><span class="badge">25%</span></div>
-          <div class="criterion"><span>Densidad del aire</span><span class="badge">10%</span></div>
-          <div class="criterion"><span>Indice turbulencia</span><span class="badge">10%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="wind_speed"><span>Velocidad viento</span><span class="badge">25%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="air_density"><span>Densidad del aire</span><span class="badge">10%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="turbulence_index"><span>Indice turbulencia</span><span class="badge">10%</span></div>
         </div>
 
         <div class="crit-category">
           <div class="crit-category-header"><span>B. Tecnicos y Suelo</span><span>35%</span></div>
-          <div class="criterion"><span>Cercania red electrica</span><span class="badge">15%</span></div>
-          <div class="criterion"><span>Pendiente maxima</span><span class="badge">10%</span></div>
-          <div class="criterion"><span>Accesibilidad vial</span><span class="badge">5%</span></div>
-          <div class="criterion"><span>Capacidad portante</span><span class="badge">5%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="grid_proximity"><span>Cercania red electrica</span><span class="badge">15%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="max_slope"><span>Pendiente maxima</span><span class="badge">10%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="road_accessibility"><span>Accesibilidad vial</span><span class="badge">5%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="bearing_capacity"><span>Capacidad portante</span><span class="badge">5%</span></div>
         </div>
 
         <div class="crit-category">
           <div class="crit-category-header"><span>C. Socio-Ambientales</span><span>20%</span></div>
-          <div class="criterion"><span>Zonas protegidas</span><span class="badge badge-excl">Excluido</span></div>
-          <div class="criterion"><span>Riesgo conflicto</span><span class="badge badge-orange">10%</span></div>
-          <div class="criterion"><span>Uso del suelo</span><span class="badge badge-green">10%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="protected_areas"><span>Zonas protegidas</span><span class="badge badge-excl">Excluido</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="conflict_risk"><span>Riesgo conflicto</span><span class="badge badge-orange">10%</span></div>
+          <div class="criterion" tabindex="0" role="button" data-criterion-id="land_use"><span>Uso del suelo</span><span class="badge badge-green">10%</span></div>
         </div>
       </aside>
 
