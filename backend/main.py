@@ -118,6 +118,8 @@ SESSION_COOKIE_NAME = "mcda_session"
 SESSION_TTL_SECONDS = int(os.getenv("AUTH_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
 AUTH_ALLOW_REGISTRATION = os.getenv("AUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes", "on"}
 AUTH_PBKDF2_ITERATIONS = 260_000
+AUTH_MAX_LOGIN_ATTEMPTS = int(os.getenv("AUTH_MAX_LOGIN_ATTEMPTS", "5"))
+AUTH_LOGIN_LOCKOUT_SECONDS = int(os.getenv("AUTH_LOGIN_LOCKOUT_SECONDS", "60"))
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -126,6 +128,7 @@ CORS_ALLOWED_ORIGINS = [
     ).split(",")
     if origin.strip()
 ]
+LOGIN_ATTEMPTS: dict[str, dict[str, int]] = {}
 
 
 def _load_auth_secret() -> bytes:
@@ -291,11 +294,65 @@ def _validate_credentials(username: str, password: str) -> tuple[str, str]:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="La contrasena debe tener entre 8 y 128 caracteres.",
         )
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La contrasena debe incluir al menos una letra y un numero.",
+        )
+    if username.lower() in password.lower():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La contrasena no debe contener el nombre de usuario.",
+        )
     return username, password
 
 
 def _registration_open() -> bool:
     return AUTH_ALLOW_REGISTRATION or _user_count() == 0
+
+
+def _login_key(request: Request, username: str) -> str:
+    client_host = request.client.host if request.client else "unknown"
+    return f"{client_host}:{username.lower()}"
+
+
+def _check_login_throttle(request: Request, username: str) -> None:
+    key = _login_key(request, username)
+    attempt = LOGIN_ATTEMPTS.get(key)
+    now = int(time.time())
+
+    if not attempt:
+        return
+
+    locked_until = int(attempt.get("locked_until", 0))
+    if locked_until > now:
+        retry_after = locked_until - now
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Demasiados intentos fallidos. Intenta de nuevo en {retry_after} segundos.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if locked_until:
+        LOGIN_ATTEMPTS.pop(key, None)
+
+
+def _record_failed_login(request: Request, username: str) -> None:
+    key = _login_key(request, username)
+    now = int(time.time())
+    attempt = LOGIN_ATTEMPTS.get(key, {"count": 0, "locked_until": 0})
+    attempt["count"] = int(attempt.get("count", 0)) + 1
+    attempt["locked_until"] = 0
+
+    if attempt["count"] >= AUTH_MAX_LOGIN_ATTEMPTS:
+        attempt["locked_until"] = now + AUTH_LOGIN_LOCKOUT_SECONDS
+        attempt["count"] = 0
+
+    LOGIN_ATTEMPTS[key] = attempt
+
+
+def _clear_failed_login(request: Request, username: str) -> None:
+    LOGIN_ATTEMPTS.pop(_login_key(request, username), None)
 
 
 _init_auth_db()
@@ -514,10 +571,11 @@ def register(credentials: AuthCredentials, response: Response):
 
 
 @app.post("/auth/login", response_model=AuthResponse, tags=["Autenticacion"])
-def login(credentials: AuthCredentials, response: Response):
+def login(credentials: AuthCredentials, request: Request, response: Response):
     """Valida credenciales y abre una sesion con cookie HTTPOnly."""
     username = _normalize_username(credentials.username)
     password = credentials.password or ""
+    _check_login_throttle(request, username)
 
     with _get_db() as conn:
         user = conn.execute(
@@ -526,11 +584,13 @@ def login(credentials: AuthCredentials, response: Response):
         ).fetchone()
 
     if not user or not user["is_active"] or not _verify_password(password, user["password_hash"]):
+        _record_failed_login(request, username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Usuario o contrasena incorrectos.",
         )
 
+    _clear_failed_login(request, username)
     _set_session_cookie(response, _create_session_token(user))
     return AuthResponse(user=_public_user(user), message="Sesion iniciada.")
 

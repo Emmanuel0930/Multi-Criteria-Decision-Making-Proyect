@@ -198,6 +198,10 @@ function getAuthNodes() {
     password: document.getElementById("auth-password"),
     confirmField: document.getElementById("auth-confirm-field"),
     confirmPassword: document.getElementById("auth-confirm-password"),
+    strength: document.getElementById("auth-strength"),
+    strengthBar: document.getElementById("auth-strength-bar"),
+    strengthText: document.getElementById("auth-strength-text"),
+    remember: document.getElementById("auth-remember"),
     submit: document.getElementById("auth-submit"),
     message: document.getElementById("auth-message"),
     switchBox: document.getElementById("auth-switch"),
@@ -213,6 +217,82 @@ function setAuthMessage(text, type = "error") {
   if (!message) return;
   message.textContent = text || "";
   message.className = type === "ok" ? "ok" : "";
+}
+
+function scorePassword(password, username = "") {
+  let score = 0;
+  const checks = {
+    length: password.length >= 8,
+    letter: /[A-Za-z]/.test(password),
+    number: /\d/.test(password),
+    mixed: /[a-z]/.test(password) && /[A-Z]/.test(password),
+    symbol: /[^A-Za-z0-9]/.test(password),
+    notUsername: Boolean(username) ? !password.toLowerCase().includes(username.toLowerCase()) : true,
+  };
+
+  if (checks.length) score += 25;
+  if (checks.letter) score += 20;
+  if (checks.number) score += 20;
+  if (checks.mixed) score += 15;
+  if (checks.symbol) score += 10;
+  if (password.length >= 12) score += 10;
+  if (!checks.notUsername) score = Math.min(score, 35);
+
+  return { score: Math.min(score, 100), checks };
+}
+
+function updatePasswordStrength() {
+  const nodes = getAuthNodes();
+  const isRegister = authMode === "register";
+  nodes.strength.hidden = !isRegister;
+  if (!isRegister) return;
+
+  const { score, checks } = scorePassword(nodes.password.value, nodes.username.value.trim());
+  let label = "Debil";
+  let color = "#ef4444";
+
+  if (score >= 75 && checks.length && checks.letter && checks.number && checks.notUsername) {
+    label = "Fuerte";
+    color = "#34d399";
+  } else if (score >= 50 && checks.length && checks.letter && checks.number) {
+    label = "Aceptable";
+    color = "#f59e0b";
+  }
+
+  nodes.strengthBar.style.width = `${score}%`;
+  nodes.strengthBar.style.background = color;
+  nodes.strengthText.textContent = checks.length && checks.letter && checks.number && checks.notUsername
+    ? `Seguridad: ${label}`
+    : "Minimo 8 caracteres, una letra y un numero. No uses tu usuario.";
+}
+
+function validateAuthForm() {
+  const nodes = getAuthNodes();
+  const username = nodes.username.value.trim();
+  const password = nodes.password.value;
+
+  if (!/^[A-Za-z0-9._-]{3,40}$/.test(username)) {
+    return "El usuario debe tener 3-40 caracteres validos.";
+  }
+
+  if (password.length < 8 || password.length > 128) {
+    return "La contrasena debe tener entre 8 y 128 caracteres.";
+  }
+
+  if (authMode === "register") {
+    const { checks } = scorePassword(password, username);
+    if (!checks.letter || !checks.number) {
+      return "La contrasena debe incluir al menos una letra y un numero.";
+    }
+    if (!checks.notUsername) {
+      return "La contrasena no debe contener el nombre de usuario.";
+    }
+    if (password !== nodes.confirmPassword.value) {
+      return "Las contrasenas no coinciden.";
+    }
+  }
+
+  return "";
 }
 
 function configureAuthMode(mode) {
@@ -243,6 +323,8 @@ function configureAuthMode(mode) {
   confirmPassword.required = isRegister;
   if (!isRegister) confirmPassword.value = "";
   submit.textContent = isRegister ? "Crear usuario" : "Entrar";
+  submit.disabled = false;
+  updatePasswordStrength();
 
   switchBox.hidden = setupRequired || !registrationOpen;
   switchText.textContent = isRegister ? "Ya tienes cuenta?" : "No tienes cuenta?";
@@ -258,6 +340,11 @@ function showAuthForm(mode, message = "") {
   nodes.panel.hidden = false;
   nodes.userMenu.hidden = true;
   configureAuthMode(mode);
+  const rememberedUser = localStorage.getItem("mcda_remembered_user") || "";
+  if (rememberedUser && !nodes.username.value) {
+    nodes.username.value = rememberedUser;
+    nodes.remember.checked = true;
+  }
   setAuthMessage(message);
   setTimeout(() => nodes.username.focus(), 50);
 }
@@ -304,12 +391,15 @@ async function submitAuth(event) {
   const password = nodes.password.value;
   const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
 
-  if (authMode === "register" && password !== nodes.confirmPassword.value) {
-    setAuthMessage("Las contrasenas no coinciden.");
+  const validationError = validateAuthForm();
+  if (validationError) {
+    setAuthMessage(validationError);
     return;
   }
 
   nodes.submit.disabled = true;
+  const submitLabel = nodes.submit.textContent;
+  nodes.submit.textContent = authMode === "register" ? "Creando..." : "Entrando...";
   setAuthMessage("");
 
   try {
@@ -324,12 +414,19 @@ async function submitAuth(event) {
     if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
 
     setAuthMessage(data.message || "Sesion iniciada.", "ok");
+    if (nodes.remember.checked) {
+      localStorage.setItem("mcda_remembered_user", username);
+    } else {
+      localStorage.removeItem("mcda_remembered_user");
+    }
     nodes.form.reset();
     unlockApp(data.user);
   } catch (err) {
     setAuthMessage(err.message || "No fue posible iniciar sesion.");
   } finally {
     nodes.submit.disabled = false;
+    nodes.submit.textContent = submitLabel;
+    updatePasswordStrength();
   }
 }
 
@@ -337,9 +434,26 @@ function toggleAuthMode() {
   const nextMode = authMode === "register" ? "login" : "register";
   const nodes = getAuthNodes();
   nodes.form.reset();
+  nodes.password.type = "password";
+  nodes.confirmPassword.type = "password";
+  document.querySelectorAll(".password-toggle").forEach(btn => {
+    btn.textContent = "Mostrar";
+    btn.setAttribute("aria-label", "Mostrar contrasena");
+  });
   setAuthMessage("");
   configureAuthMode(nextMode);
   nodes.username.focus();
+}
+
+function togglePasswordVisibility(event) {
+  const targetId = event.currentTarget.dataset.target;
+  const input = document.getElementById(targetId);
+  if (!input) return;
+
+  const show = input.type === "password";
+  input.type = show ? "text" : "password";
+  event.currentTarget.textContent = show ? "Ocultar" : "Mostrar";
+  event.currentTarget.setAttribute("aria-label", show ? "Ocultar contrasena" : "Mostrar contrasena");
 }
 
 async function logout() {
@@ -969,5 +1083,19 @@ if (logoutBtn) logoutBtn.addEventListener("click", logout);
 
 const authSwitchBtn = document.getElementById("auth-switch-btn");
 if (authSwitchBtn) authSwitchBtn.addEventListener("click", toggleAuthMode);
+
+document.querySelectorAll(".password-toggle").forEach(btn => {
+  btn.addEventListener("click", togglePasswordVisibility);
+});
+
+["auth-username", "auth-password", "auth-confirm-password"].forEach(id => {
+  const input = document.getElementById(id);
+  if (input) {
+    input.addEventListener("input", () => {
+      updatePasswordStrength();
+      setAuthMessage("");
+    });
+  }
+});
 
 window.addEventListener("load", checkAuthStatus);

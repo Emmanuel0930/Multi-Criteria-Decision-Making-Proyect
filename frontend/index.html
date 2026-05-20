@@ -126,6 +126,91 @@
       box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
     }
 
+    .password-wrap {
+      position: relative;
+    }
+
+    .password-wrap input {
+      padding-right: 78px;
+    }
+
+    .password-toggle {
+      position: absolute;
+      top: 50%;
+      right: 8px;
+      transform: translateY(-50%);
+      height: 25px;
+      border: 1px solid #2d3f59;
+      border-radius: 6px;
+      background: #121d2d;
+      color: #a9bdd6;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 0 8px;
+    }
+
+    .password-toggle:hover,
+    .password-toggle:focus-visible {
+      border-color: #4b6386;
+      color: #dbe7f5;
+      outline: none;
+    }
+
+    .auth-hint {
+      margin-top: -6px;
+      margin-bottom: 12px;
+      color: #8296b3;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .password-strength {
+      margin: -4px 0 12px;
+    }
+
+    .strength-track {
+      height: 5px;
+      border-radius: 999px;
+      background: #1b2a40;
+      overflow: hidden;
+    }
+
+    #auth-strength-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: #64748b;
+      transition: width 0.2s ease, background 0.2s ease;
+    }
+
+    #auth-strength-text {
+      margin-top: 6px;
+      color: #8296b3;
+      font-size: 11px;
+    }
+
+    .auth-options {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 4px 0 2px;
+      color: #9fb1ca;
+      font-size: 12px;
+    }
+
+    .auth-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      cursor: pointer;
+    }
+
+    .auth-check input {
+      accent-color: #3b82f6;
+    }
+
     .auth-actions {
       display: flex;
       align-items: center;
@@ -135,6 +220,7 @@
 
     #auth-submit {
       height: 39px;
+      width: 100%;
       border-radius: 7px;
       border: 1px solid #1f4d88;
       background: #163458;
@@ -142,6 +228,12 @@
       padding: 0 16px;
       cursor: pointer;
       font-weight: 700;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    #auth-submit:hover:not(:disabled) {
+      background: #1d416d;
+      border-color: #2d66ad;
     }
 
     #auth-submit:disabled {
@@ -674,30 +766,48 @@
               required
             />
           </div>
+          <div id="auth-username-hint" class="auth-hint">Usa letras, numeros, punto, guion o guion bajo.</div>
 
           <div class="auth-field">
             <label for="auth-password">Contrasena</label>
-            <input
-              id="auth-password"
-              name="password"
-              type="password"
-              minlength="8"
-              maxlength="128"
-              autocomplete="current-password"
-              required
-            />
+            <div class="password-wrap">
+              <input
+                id="auth-password"
+                name="password"
+                type="password"
+                minlength="8"
+                maxlength="128"
+                autocomplete="current-password"
+                required
+              />
+              <button class="password-toggle" type="button" data-target="auth-password" aria-label="Mostrar contrasena">Mostrar</button>
+            </div>
+          </div>
+          <div id="auth-strength" class="password-strength" hidden>
+            <div class="strength-track"><div id="auth-strength-bar"></div></div>
+            <div id="auth-strength-text">Minimo 8 caracteres, una letra y un numero.</div>
           </div>
 
           <div id="auth-confirm-field" class="auth-field" hidden>
             <label for="auth-confirm-password">Confirmar contrasena</label>
-            <input
-              id="auth-confirm-password"
-              name="confirm-password"
-              type="password"
-              minlength="8"
-              maxlength="128"
-              autocomplete="new-password"
-            />
+            <div class="password-wrap">
+              <input
+                id="auth-confirm-password"
+                name="confirm-password"
+                type="password"
+                minlength="8"
+                maxlength="128"
+                autocomplete="new-password"
+              />
+              <button class="password-toggle" type="button" data-target="auth-confirm-password" aria-label="Mostrar confirmacion">Mostrar</button>
+            </div>
+          </div>
+
+          <div class="auth-options">
+            <label class="auth-check">
+              <input id="auth-remember" type="checkbox" />
+              Recordar usuario
+            </label>
           </div>
 
           <div class="auth-actions">
