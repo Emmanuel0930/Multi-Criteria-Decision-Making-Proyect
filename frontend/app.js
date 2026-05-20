@@ -21,6 +21,12 @@ const CENTRE_LAT  = 4.711;
 const CENTRE_LON  = -74.072;
 const INIT_ZOOM   = 6;
 
+let appInitialized = false;
+let authMode = "login";
+let currentUser = null;
+let registrationOpen = false;
+let setupRequired = false;
+
 // Paleta RdYlGn idéntica a la de visualization.py
 const PALETTE = [
   "#a50026","#d73027","#f46d43","#fdae61","#fee08b",
@@ -177,6 +183,199 @@ function bindCriterionDescriptions() {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Autenticacion
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getAuthNodes() {
+  return {
+    screen: document.getElementById("auth-screen"),
+    loading: document.getElementById("auth-loading"),
+    panel: document.getElementById("auth-panel"),
+    title: document.getElementById("auth-title"),
+    subtitle: document.getElementById("auth-subtitle"),
+    form: document.getElementById("auth-form"),
+    username: document.getElementById("auth-username"),
+    password: document.getElementById("auth-password"),
+    confirmField: document.getElementById("auth-confirm-field"),
+    confirmPassword: document.getElementById("auth-confirm-password"),
+    submit: document.getElementById("auth-submit"),
+    message: document.getElementById("auth-message"),
+    switchBox: document.getElementById("auth-switch"),
+    switchText: document.getElementById("auth-switch-text"),
+    switchButton: document.getElementById("auth-switch-btn"),
+    userMenu: document.getElementById("user-menu"),
+    userName: document.getElementById("user-name"),
+  };
+}
+
+function setAuthMessage(text, type = "error") {
+  const { message } = getAuthNodes();
+  if (!message) return;
+  message.textContent = text || "";
+  message.className = type === "ok" ? "ok" : "";
+}
+
+function configureAuthMode(mode) {
+  authMode = mode;
+  const {
+    title,
+    subtitle,
+    password,
+    confirmField,
+    confirmPassword,
+    submit,
+    switchBox,
+    switchText,
+    switchButton,
+  } = getAuthNodes();
+  const isRegister = mode === "register";
+
+  title.textContent = isRegister
+    ? (setupRequired ? "Crear primer usuario" : "Crear cuenta")
+    : "Iniciar sesion";
+  subtitle.textContent = isRegister
+    ? (setupRequired
+      ? "Configura el usuario administrador inicial para proteger el panel."
+      : "Crea un usuario para acceder al panel de evaluacion eolica.")
+    : "Accede al panel de evaluacion eolica.";
+  password.autocomplete = isRegister ? "new-password" : "current-password";
+  confirmField.hidden = !isRegister;
+  confirmPassword.required = isRegister;
+  if (!isRegister) confirmPassword.value = "";
+  submit.textContent = isRegister ? "Crear usuario" : "Entrar";
+
+  switchBox.hidden = setupRequired || !registrationOpen;
+  switchText.textContent = isRegister ? "Ya tienes cuenta?" : "No tienes cuenta?";
+  switchButton.textContent = isRegister ? "Iniciar sesion" : "Crear cuenta";
+}
+
+function showAuthForm(mode, message = "") {
+  const nodes = getAuthNodes();
+  document.body.classList.remove("auth-pending", "authenticated");
+  document.body.classList.add("auth-locked");
+  nodes.screen.hidden = false;
+  nodes.loading.hidden = true;
+  nodes.panel.hidden = false;
+  nodes.userMenu.hidden = true;
+  configureAuthMode(mode);
+  setAuthMessage(message);
+  setTimeout(() => nodes.username.focus(), 50);
+}
+
+function unlockApp(user) {
+  currentUser = user;
+  const nodes = getAuthNodes();
+  document.body.classList.remove("auth-pending", "auth-locked");
+  document.body.classList.add("authenticated");
+  nodes.screen.hidden = true;
+  nodes.userMenu.hidden = false;
+  nodes.userName.textContent = user?.username ? `Sesion: ${user.username}` : "";
+  setAuthMessage("");
+  initializeApp();
+}
+
+async function checkAuthStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/auth/status`, { credentials: "same-origin" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const statusData = await res.json();
+    registrationOpen = Boolean(statusData.registration_open);
+    setupRequired = Boolean(statusData.setup_required);
+
+    if (statusData.authenticated && statusData.user) {
+      unlockApp(statusData.user);
+      return;
+    }
+
+    showAuthForm(setupRequired ? "register" : "login");
+  } catch (err) {
+    console.warn("[AUTH] No fue posible verificar la sesion:", err);
+    registrationOpen = false;
+    setupRequired = false;
+    showAuthForm("login", "No se pudo verificar la sesion. Revisa que el backend este activo.");
+  }
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+
+  const nodes = getAuthNodes();
+  const username = nodes.username.value.trim();
+  const password = nodes.password.value;
+  const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
+
+  if (authMode === "register" && password !== nodes.confirmPassword.value) {
+    setAuthMessage("Las contrasenas no coinciden.");
+    return;
+  }
+
+  nodes.submit.disabled = true;
+  setAuthMessage("");
+
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    setAuthMessage(data.message || "Sesion iniciada.", "ok");
+    nodes.form.reset();
+    unlockApp(data.user);
+  } catch (err) {
+    setAuthMessage(err.message || "No fue posible iniciar sesion.");
+  } finally {
+    nodes.submit.disabled = false;
+  }
+}
+
+function toggleAuthMode() {
+  const nextMode = authMode === "register" ? "login" : "register";
+  const nodes = getAuthNodes();
+  nodes.form.reset();
+  setAuthMessage("");
+  configureAuthMode(nextMode);
+  nodes.username.focus();
+}
+
+async function logout() {
+  try {
+    await fetch(`${API_BASE}/auth/logout`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+  } finally {
+    window.location.reload();
+  }
+}
+
+async function handleExpiredSession() {
+  currentUser = null;
+  showAuthForm("login", "Tu sesion expiro. Vuelve a iniciar sesion.");
+}
+
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "same-origin",
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+    },
+  });
+
+  if (res.status === 401) {
+    await handleExpiredSession();
+    throw new Error("Sesion expirada.");
+  }
+
+  return res;
+}
+
+
 // UI helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -613,7 +812,7 @@ function initMap() {
  */
 async function fetchModels() {
   try {
-    const res    = await fetch(`${API_BASE}/models`);
+    const res    = await apiFetch("/models");
     if (!res.ok) return;
     const models = await res.json();
     const sel    = document.getElementById("model-select");
@@ -641,7 +840,7 @@ async function loadModel() {
   showLegend(false);
 
   try {
-    const res = await fetch(`${API_BASE}/run-model`, {
+    const res = await apiFetch("/run-model", {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({ model: modelId }),
@@ -748,9 +947,27 @@ if (grpName) {
 // Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
 
-window.addEventListener("load", () => {
+function initializeApp() {
+  if (appInitialized) {
+    if (map) setTimeout(() => map.invalidateSize(), 50);
+    return;
+  }
+
+  appInitialized = true;
   initMap();
   bindCriterionDescriptions();
   renderGroupCompareTable();
   fetchModels();     // decorar opciones del select con ✓ si ya tienen caché
-});
+  setTimeout(() => map.invalidateSize(), 50);
+}
+
+const authForm = document.getElementById("auth-form");
+if (authForm) authForm.addEventListener("submit", submitAuth);
+
+const logoutBtn = document.getElementById("logout-btn");
+if (logoutBtn) logoutBtn.addEventListener("click", logout);
+
+const authSwitchBtn = document.getElementById("auth-switch-btn");
+if (authSwitchBtn) authSwitchBtn.addEventListener("click", toggleAuthMode);
+
+window.addEventListener("load", checkAuthStatus);

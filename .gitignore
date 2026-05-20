@@ -5,3 +5,5 @@ wlc.json
 map_interactive.html
 score_distribution.png
 feature_correlation.png
+data/auth.db
+data/auth_secret.key

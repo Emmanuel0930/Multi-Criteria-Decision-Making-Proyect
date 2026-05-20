@@ -19,10 +19,18 @@ from __future__ import annotations
 import importlib
 import sys
 import os
+import base64
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import time
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -104,6 +112,194 @@ def _records_to_lods(scored_records: list, ranked_records: list, score_column: s
 # Ruta donde están los JSON cacheados
 cache_manager.CACHE_DIR = ROOT / "outputs"
 
+AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", str(ROOT / "data" / "auth.db")))
+AUTH_SECRET_PATH = Path(os.getenv("AUTH_SECRET_PATH", str(ROOT / "data" / "auth_secret.key")))
+SESSION_COOKIE_NAME = "mcda_session"
+SESSION_TTL_SECONDS = int(os.getenv("AUTH_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
+AUTH_ALLOW_REGISTRATION = os.getenv("AUTH_ALLOW_REGISTRATION", "true").lower() in {"1", "true", "yes", "on"}
+AUTH_PBKDF2_ITERATIONS = 260_000
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+]
+
+
+def _load_auth_secret() -> bytes:
+    """Carga o crea el secreto local usado para firmar cookies de sesion."""
+    secret = os.getenv("AUTH_SECRET_KEY")
+    if secret:
+        return secret.encode("utf-8")
+
+    AUTH_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not AUTH_SECRET_PATH.exists():
+        AUTH_SECRET_PATH.write_text(secrets.token_urlsafe(48), encoding="utf-8")
+    return AUTH_SECRET_PATH.read_text(encoding="utf-8").strip().encode("utf-8")
+
+
+AUTH_SECRET = _load_auth_secret()
+
+
+def _get_db() -> sqlite3.Connection:
+    AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_auth_db() -> None:
+    with _get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def _user_count() -> int:
+    with _get_db() as conn:
+        row = conn.execute("SELECT COUNT(*) AS total FROM users").fetchone()
+    return int(row["total"])
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, AUTH_PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        AUTH_PBKDF2_ITERATIONS,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_b64.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("ascii"))
+
+
+def _sign(payload: bytes) -> str:
+    return _b64url(hmac.new(AUTH_SECRET, payload, hashlib.sha256).digest())
+
+
+def _create_session_token(user: sqlite3.Row) -> str:
+    payload = {
+        "sub": int(user["id"]),
+        "username": user["username"],
+        "role": user["role"],
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded_payload = _b64url(payload_bytes)
+    return f"{encoded_payload}.{_sign(encoded_payload.encode('ascii'))}"
+
+
+def _read_session_token(token: str | None) -> dict | None:
+    if not token or "." not in token:
+        return None
+    encoded_payload, signature = token.rsplit(".", 1)
+    if not hmac.compare_digest(_sign(encoded_payload.encode("ascii")), signature):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(encoded_payload))
+    except Exception:
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload
+
+
+def _public_user(row: sqlite3.Row | dict) -> dict:
+    return {
+        "id": int(row["id"]),
+        "username": row["username"],
+        "role": row["role"],
+    }
+
+
+def get_current_user(mcda_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)) -> dict:
+    payload = _read_session_token(mcda_session)
+    if not payload or "sub" not in payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autenticado.")
+
+    with _get_db() as conn:
+        user = conn.execute(
+            "SELECT id, username, role, is_active FROM users WHERE id = ?",
+            (payload["sub"],),
+        ).fetchone()
+
+    if not user or not user["is_active"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario no disponible.")
+    return _public_user(user)
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=os.getenv("AUTH_COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"},
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+
+def _normalize_username(username: str) -> str:
+    return username.strip()
+
+
+def _validate_credentials(username: str, password: str) -> tuple[str, str]:
+    username = _normalize_username(username)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{3,40}", username):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="El usuario debe tener 3-40 caracteres y usar letras, numeros, punto, guion o guion bajo.",
+        )
+    if len(password) < 8 or len(password) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La contrasena debe tener entre 8 y 128 caracteres.",
+        )
+    return username, password
+
+
+def _registration_open() -> bool:
+    return AUTH_ALLOW_REGISTRATION or _user_count() == 0
+
+
+_init_auth_db()
+
 # Modelos disponibles: clave → metadatos
 MODEL_REGISTRY: dict[str, dict] = {
     "ahp": {
@@ -151,7 +347,8 @@ async def disable_frontend_cache(request: Request, call_next):
 # CORS: permite que el frontend (cualquier origen en desarrollo) consuma la API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # En producción, reemplazar con el dominio exacto
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -196,6 +393,30 @@ class RunModelRequest(BaseModel):
     force_rerun: bool = False        # True → ignora caché y recalcula
 
 
+class AuthCredentials(BaseModel):
+    username: str
+    password: str
+
+
+class AuthUser(BaseModel):
+    id: int
+    username: str
+    role: str
+
+
+class AuthStatus(BaseModel):
+    authenticated: bool
+    user: AuthUser | None = None
+    registration_open: bool
+    setup_required: bool
+    session_ttl_seconds: int
+
+
+class AuthResponse(BaseModel):
+    user: AuthUser
+    message: str
+
+
 class ModelInfo(BaseModel):
     id:          str
     label:       str
@@ -222,8 +443,113 @@ def health():
     return {"status": "ok", "cache_dir": str(cache_manager.CACHE_DIR)}
 
 
+@app.get("/auth/status", response_model=AuthStatus, tags=["Autenticacion"])
+def auth_status(
+    response: Response,
+    mcda_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+):
+    """Retorna el estado de sesion y si esta abierto el registro inicial."""
+    payload = _read_session_token(mcda_session)
+    user = None
+
+    if payload and "sub" in payload:
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT id, username, role, is_active FROM users WHERE id = ?",
+                (payload["sub"],),
+            ).fetchone()
+        if row and row["is_active"]:
+            user = _public_user(row)
+
+    if not user and mcda_session:
+        _clear_session_cookie(response)
+
+    setup_required = _user_count() == 0
+
+    return AuthStatus(
+        authenticated=bool(user),
+        user=user,
+        registration_open=_registration_open(),
+        setup_required=setup_required,
+        session_ttl_seconds=SESSION_TTL_SECONDS,
+    )
+
+
+@app.post("/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED, tags=["Autenticacion"])
+def register(credentials: AuthCredentials, response: Response):
+    """
+    Crea un usuario. El primer usuario queda como admin; los siguientes como user.
+    Para cerrar registros posteriores, usar AUTH_ALLOW_REGISTRATION=false.
+    """
+    if not _registration_open():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="El registro esta cerrado. Inicia sesion con un usuario existente.",
+        )
+
+    username, password = _validate_credentials(credentials.username, credentials.password)
+    role = "admin" if _user_count() == 0 else "user"
+
+    try:
+        with _get_db() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, _hash_password(password), role, int(time.time())),
+            )
+            user = conn.execute(
+                "SELECT id, username, role FROM users WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ese usuario ya existe.",
+        )
+
+    _set_session_cookie(response, _create_session_token(user))
+    return AuthResponse(user=_public_user(user), message="Usuario creado correctamente.")
+
+
+@app.post("/auth/login", response_model=AuthResponse, tags=["Autenticacion"])
+def login(credentials: AuthCredentials, response: Response):
+    """Valida credenciales y abre una sesion con cookie HTTPOnly."""
+    username = _normalize_username(credentials.username)
+    password = credentials.password or ""
+
+    with _get_db() as conn:
+        user = conn.execute(
+            "SELECT id, username, password_hash, role, is_active FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+
+    if not user or not user["is_active"] or not _verify_password(password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuario o contrasena incorrectos.",
+        )
+
+    _set_session_cookie(response, _create_session_token(user))
+    return AuthResponse(user=_public_user(user), message="Sesion iniciada.")
+
+
+@app.post("/auth/logout", tags=["Autenticacion"])
+def logout(response: Response):
+    """Cierra la sesion eliminando la cookie."""
+    _clear_session_cookie(response)
+    return {"message": "Sesion cerrada."}
+
+
+@app.get("/auth/me", response_model=AuthUser, tags=["Autenticacion"])
+def me(current_user: dict = Depends(get_current_user)):
+    """Retorna el usuario autenticado actual."""
+    return current_user
+
+
 @app.get("/models", response_model=list[ModelInfo], tags=["Modelos"])
-def list_models():
+def list_models(current_user: dict = Depends(get_current_user)):
     """
     Retorna la lista de modelos disponibles con su estado de caché.
     """
@@ -240,7 +566,7 @@ def list_models():
 
 
 @app.post("/run-model", response_model=RunModelResponse, tags=["Modelos"])
-def run_model(req: RunModelRequest):
+def run_model(req: RunModelRequest, current_user: dict = Depends(get_current_user)):
     """
     Carga o ejecuta un modelo MCDA.
 

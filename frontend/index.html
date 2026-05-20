@@ -38,6 +38,150 @@
       overflow: hidden;
     }
 
+    body.auth-pending #app-shell,
+    body.auth-locked #app-shell {
+      display: none;
+    }
+
+    .auth-screen {
+      min-height: 100%;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        linear-gradient(135deg, rgba(13, 17, 23, 0.96), rgba(17, 25, 38, 0.92)),
+        url("https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1600&q=70") center/cover;
+    }
+
+    .auth-screen[hidden] {
+      display: none;
+    }
+
+    .auth-card {
+      width: min(420px, 100%);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 8px;
+      background: rgba(12, 18, 28, 0.94);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.36);
+      padding: 28px;
+    }
+
+    .auth-brand {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      color: #dbe7f5;
+      margin-bottom: 18px;
+    }
+
+    .auth-brand b { color: #93c5fd; }
+
+    .auth-card h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .auth-subtitle {
+      margin: 0 0 22px;
+      color: #9fb1ca;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .auth-loading {
+      color: #b9c9dd;
+      font-size: 13px;
+    }
+
+    .auth-field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 14px;
+    }
+
+    .auth-field label {
+      color: #a9bdd6;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+    }
+
+    .auth-field input {
+      width: 100%;
+      height: 39px;
+      border: 1px solid #26364c;
+      border-radius: 7px;
+      background: #0c1420;
+      color: var(--text);
+      padding: 0 11px;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .auth-field input:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+    }
+
+    .auth-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    #auth-submit {
+      height: 39px;
+      border-radius: 7px;
+      border: 1px solid #1f4d88;
+      background: #163458;
+      color: #d6e8ff;
+      padding: 0 16px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    #auth-submit:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+
+    #auth-message {
+      min-height: 18px;
+      margin-top: 14px;
+      color: #fca5a5;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    #auth-message.ok { color: #86efac; }
+
+    .auth-switch {
+      margin-top: 12px;
+      color: #9fb1ca;
+      font-size: 12px;
+    }
+
+    #auth-switch-btn {
+      border: 0;
+      background: transparent;
+      color: #93c5fd;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      padding: 0;
+    }
+
+    #auth-switch-btn:hover,
+    #auth-switch-btn:focus-visible {
+      color: #bfdbfe;
+      text-decoration: underline;
+      outline: none;
+    }
+
     #app-shell {
       height: 100%;
       display: grid;
@@ -77,6 +221,33 @@
     #status-chip.error { color: #f87171; border-color: #7f1d1d; }
 
     .spacer { flex: 1; }
+
+    .user-menu {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #a9bdd6;
+      font-size: 12px;
+    }
+
+    .user-menu[hidden] {
+      display: none;
+    }
+
+    #logout-btn {
+      height: 30px;
+      border-radius: 7px;
+      border: 1px solid #33445d;
+      background: #111c2c;
+      color: #d0deef;
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0 10px;
+    }
+
+    #logout-btn:hover {
+      border-color: #4b6386;
+    }
 
     #model-select, #load-btn {
       height: 31px;
@@ -479,12 +650,80 @@
     }
   </style>
 </head>
-<body>
+<body class="auth-pending">
+  <section id="auth-screen" class="auth-screen" aria-live="polite">
+    <div class="auth-card">
+      <div id="auth-loading" class="auth-loading">Verificando sesion...</div>
+
+      <div id="auth-panel" hidden>
+        <div class="auth-brand">Prototipo <b>MCDM</b></div>
+        <h1 id="auth-title">Iniciar sesion</h1>
+        <p id="auth-subtitle" class="auth-subtitle">Accede al panel de evaluacion eolica.</p>
+
+        <form id="auth-form" autocomplete="on">
+          <div class="auth-field">
+            <label for="auth-username">Usuario</label>
+            <input
+              id="auth-username"
+              name="username"
+              type="text"
+              minlength="3"
+              maxlength="40"
+              pattern="[A-Za-z0-9._-]{3,40}"
+              autocomplete="username"
+              required
+            />
+          </div>
+
+          <div class="auth-field">
+            <label for="auth-password">Contrasena</label>
+            <input
+              id="auth-password"
+              name="password"
+              type="password"
+              minlength="8"
+              maxlength="128"
+              autocomplete="current-password"
+              required
+            />
+          </div>
+
+          <div id="auth-confirm-field" class="auth-field" hidden>
+            <label for="auth-confirm-password">Confirmar contrasena</label>
+            <input
+              id="auth-confirm-password"
+              name="confirm-password"
+              type="password"
+              minlength="8"
+              maxlength="128"
+              autocomplete="new-password"
+            />
+          </div>
+
+          <div class="auth-actions">
+            <button id="auth-submit" type="submit">Entrar</button>
+          </div>
+
+          <div id="auth-message" role="alert"></div>
+
+          <div id="auth-switch" class="auth-switch">
+            <span id="auth-switch-text">No tienes cuenta?</span>
+            <button id="auth-switch-btn" type="button">Crear cuenta</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </section>
+
   <div id="app-shell">
     <header id="topbar">
       <div class="brand">Prototipo <b>MCDM</b></div>
       <div id="status-chip"></div>
       <div class="spacer"></div>
+      <div id="user-menu" class="user-menu" hidden>
+        <span id="user-name"></span>
+        <button id="logout-btn" type="button">Salir</button>
+      </div>
       <select id="model-select">
         <option value="">Seleccionar metodo</option>
         <option value="ahp">AHP</option>

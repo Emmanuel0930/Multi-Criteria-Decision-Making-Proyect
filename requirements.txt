@@ -6,3 +6,4 @@ matplotlib
 folium
 fastapi
 uvicorn[standard]
+httpx
